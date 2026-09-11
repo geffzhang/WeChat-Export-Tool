@@ -16,6 +16,7 @@ public partial class MainWindowViewModel : ObservableObject
 {
     private readonly DatabaseService _databaseService;
     private readonly WeChatPathService _weChatPathService;
+    private readonly KeyCaptureService _keyCaptureService;
 
     [ObservableProperty]
     private string _title = "WeChat Export Tool";
@@ -31,6 +32,8 @@ public partial class MainWindowViewModel : ObservableObject
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(LoadMessagesCommand))]
     [NotifyCanExecuteChangedFor(nameof(ExportCommand))]
+    [NotifyPropertyChangedFor(nameof(ShowConnectHint))]
+    [NotifyPropertyChangedFor(nameof(ShowSelectContactHint))]
     private bool _isConnected;
 
     [ObservableProperty]
@@ -44,7 +47,19 @@ public partial class MainWindowViewModel : ObservableObject
     private ObservableCollection<Contact> _contacts = new();
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ShowSelectContactHint))]
     private Contact? _selectedContact;
+
+    /// <summary>
+    /// Empty-state hint shown when there is no database connection yet. The
+    /// connection-oriented wording lives here so the view does not have to invert
+    /// its own visibility rule (which previously showed the "select a contact"
+    /// text while disconnected).
+    /// </summary>
+    public bool ShowConnectHint => !IsConnected;
+
+    /// <summary>Empty-state hint shown once connected but with no conversation open.</summary>
+    public bool ShowSelectContactHint => IsConnected && SelectedContact is null;
 
     // Message view
     [ObservableProperty]
@@ -67,6 +82,7 @@ public partial class MainWindowViewModel : ObservableObject
     {
         _databaseService = new DatabaseService();
         _weChatPathService = new WeChatPathService();
+        _keyCaptureService = new KeyCaptureService();
 
         // ObservableCollection mutations do not raise PropertyChanged, so the
         // attribute-based NotifyCanExecuteChangedFor cannot see them. CanExport()
@@ -82,15 +98,46 @@ public partial class MainWindowViewModel : ObservableObject
             ExportCommand.NotifyCanExecuteChanged();
         };
 
+        RestoreSavedKey();
+
         // Initialize with default WeChat path
         TrySetDefaultWeChatPath();
+    }
+
+    /// <summary>
+    /// Prefills the decryption key from the last successful session. Never
+    /// overwrites a value the user has already typed.
+    /// </summary>
+    private void RestoreSavedKey()
+    {
+        try
+        {
+            if (!string.IsNullOrEmpty(DecryptionKey))
+                return;
+
+            var savedKey = _keyCaptureService.LoadKey();
+            if (!string.IsNullOrEmpty(savedKey))
+            {
+                DecryptionKey = savedKey;
+                Log.Information("Restored previously saved decryption key");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to restore saved decryption key");
+        }
     }
 
     private void TrySetDefaultWeChatPath()
     {
         try
         {
-            var defaultPath = _weChatPathService.DetectWeChatPath();
+            // Prefer a real data root (where the message databases actually live).
+            // The install directory is only a last resort so the field is not left
+            // empty on a machine where detection of the data folder fails.
+            var defaultPath = _weChatPathService.DetectWeChatDataRoot()
+                              ?? _weChatPathService.DetectWeChatPath();
+
             if (!string.IsNullOrEmpty(defaultPath) && Directory.Exists(defaultPath))
             {
                 WeChatPath = defaultPath;
@@ -122,26 +169,63 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     [RelayCommand]
-    private void BrowseWeChatPath()
+    private async Task BrowseWeChatPath()
     {
+        var storageProvider = Views.MainWindow.Current?.StorageProvider;
+        if (storageProvider == null)
+        {
+            StatusMessage = "Browse unavailable: no active window";
+            return;
+        }
+
         try
         {
-            var defaultPath = _weChatPathService.DetectWeChatPath();
-            if (!string.IsNullOrEmpty(defaultPath) && Directory.Exists(defaultPath))
+            // A real folder picker. This previously re-ran auto-detection, which
+            // silently overwrote whatever the user had typed into the field.
+            var folders = await storageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
             {
-                WeChatPath = defaultPath;
-                StatusMessage = $"WeChat path set to: {WeChatPath}";
-            }
-            else
+                Title = "Select the WeChat data folder (e.g. Documents\\WeChat Files or an account folder)",
+                AllowMultiple = false
+            });
+
+            var picked = folders.Count > 0 ? folders[0].Path.LocalPath : null;
+            if (string.IsNullOrEmpty(picked))
             {
-                StatusMessage = "Could not auto-detect WeChat installation";
+                StatusMessage = "Folder selection cancelled";
+                return;
             }
+
+            WeChatPath = picked;
+            StatusMessage = $"WeChat data folder set to: {picked}";
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Failed to browse WeChat path");
-            StatusMessage = "Failed to browse WeChat path";
+            Log.Error(ex, "Failed to browse for the WeChat data folder");
+            StatusMessage = "Failed to open the folder picker";
         }
+    }
+
+    /// <summary>
+    /// Manual key-capture attempt. Exposes <see cref="KeyCaptureService.IsWeChatRunning"/>
+    /// so a failed attempt gives the user a real hint; the process-memory scan itself
+    /// remains a deliberate stub (see KeyCaptureService.CaptureKeyFromProcess).
+    /// </summary>
+    [RelayCommand]
+    private void CaptureKey()
+    {
+        var isRunning = _keyCaptureService.IsWeChatRunning();
+        var captured = isRunning ? _keyCaptureService.CaptureKeyFromProcess() : null;
+
+        if (!string.IsNullOrWhiteSpace(captured))
+        {
+            DecryptionKey = captured;
+            StatusMessage = "Decryption key captured from the running WeChat process";
+            return;
+        }
+
+        StatusMessage = isRunning
+            ? "WeChat is running, but automatic key capture is not implemented yet - paste the key manually."
+            : "WeChat does not appear to be running. Start and sign in to WeChat, or paste the key manually.";
     }
 
     [RelayCommand(CanExecute = nameof(CanConnect))]
@@ -152,48 +236,56 @@ public partial class MainWindowViewModel : ObservableObject
 
         try
         {
-            await Task.Run(() =>
+            // Capture the key on the UI thread and hand it to the database layer.
+            // It previously stopped here: it was logged and then dropped on the
+            // floor, so the connection was always attempted without it.
+            var key = DecryptionKey;
+
+            var result = await Task.Run(() =>
             {
-                // First try to find the MSG database
                 var msgDbPath = FindMsgDatabase();
 
                 if (string.IsNullOrEmpty(msgDbPath))
                 {
-                    // Try default location
-                    msgDbPath = _databaseService.GetDefaultMsgDatabasePath();
+                    return new ConnectResult(
+                        ConnectOutcome.FileNotFound,
+                        "Could not find a WeChat message database. Check the WeChat data folder and try again.");
                 }
 
-                if (string.IsNullOrEmpty(msgDbPath))
-                {
-                    throw new Exception("Could not find WeChat MSG database");
-                }
-
-                // Apply decryption key if provided
-                if (!string.IsNullOrEmpty(DecryptionKey))
-                {
-                    // Key would be used for decrypting the database
-                    Log.Information("Using provided decryption key");
-                }
-
-                return _databaseService.Connect(msgDbPath);
+                Log.Information("Connecting to {DbPath} (key supplied: {HasKey})", msgDbPath, !string.IsNullOrEmpty(key));
+                return _databaseService.Connect(msgDbPath, key);
             });
 
-            if (_databaseService.IsConnected)
+            if (result.IsSuccess)
             {
                 IsConnected = true;
-                StatusMessage = "Connected successfully";
+                StatusMessage = result.Message;
 
-                // Load contacts
+                // Persist the key that actually worked, so the next session does not
+                // have to re-enter it.
+                if (!string.IsNullOrEmpty(key))
+                {
+                    _keyCaptureService.SaveKey(key);
+                }
+
                 await LoadContacts();
+                return;
             }
-            else
-            {
-                StatusMessage = "Failed to connect to database";
-            }
+
+            // Each failure mode reports its own reason rather than leaving a green
+            // "Connected" light over an empty contact list.
+            Log.Warning("Connect failed ({Outcome}): {Message}", result.Outcome, result.Message);
+            IsConnected = false;
+            ContactCount = 0;
+            MessageCount = 0;
+            Contacts.Clear();
+            Messages.Clear();
+            StatusMessage = result.Message;
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to connect to database");
+            IsConnected = false;
             StatusMessage = $"Connection failed: {ex.Message}";
         }
         finally
@@ -209,26 +301,11 @@ public partial class MainWindowViewModel : ObservableObject
 
     private string? FindMsgDatabase()
     {
-        if (string.IsNullOrEmpty(WeChatPath))
-            return null;
-
-        // Look for MSG database in the WeChat installation path
-        // Typically: %APPDATA%\Tencent\WeChat\Msg\Msg*.db
-        var msgPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-            "Tencent", "WeChat", "Msg");
-
-        if (Directory.Exists(msgPath))
-        {
-            var dbFiles = Directory.GetFiles(msgPath, "Msg*.db");
-            if (dbFiles.Length > 0)
-            {
-                // Return the most recent one
-                return dbFiles.OrderByDescending(f => File.GetLastWriteTime(f)).First();
-            }
-        }
-
-        return null;
+        // WeChatPath now actually drives the lookup: it is searched first, and the
+        // known default locations are only used as a fallback. The previous version
+        // ignored the field entirely and always scanned
+        // %APPDATA%\Tencent\WeChat\Msg, which is not where WeChat stores history.
+        return _weChatPathService.FindMsgDatabase(WeChatPath);
     }
 
     [RelayCommand]
@@ -240,6 +317,7 @@ public partial class MainWindowViewModel : ObservableObject
             StatusMessage = "Loading contacts...";
 
             var contacts = await Task.Run(() => _databaseService.GetContacts());
+            var error = _databaseService.LastError;
 
             Contacts.Clear();
             foreach (var contact in contacts)
@@ -248,7 +326,17 @@ public partial class MainWindowViewModel : ObservableObject
             }
 
             ContactCount = Contacts.Count;
-            StatusMessage = $"Loaded {ContactCount} contacts";
+
+            if (error is not null)
+            {
+                // A failed read must not masquerade as a successful empty result.
+                Log.Error("Contact load reported an error: {Error}", error);
+                StatusMessage = error;
+            }
+            else
+            {
+                StatusMessage = $"Loaded {ContactCount} contacts";
+            }
         }
         catch (Exception ex)
         {
@@ -272,8 +360,20 @@ public partial class MainWindowViewModel : ObservableObject
             IsLoading = true;
             StatusMessage = $"Loading messages for {SelectedContact.DisplayName}...";
 
+            var contact = SelectedContact;
+
+            // Per-sender lookup so a message can be attributed to the sender that
+            // actually wrote it. Where a sender id is not present here,
+            // DatabaseService falls back to the conversation's contact name, which is
+            // what keeps one-to-one chats from rendering a blank sender.
+            var senderNames = Contacts
+                .Where(c => c.UserId > 0 && !string.IsNullOrWhiteSpace(c.DisplayName))
+                .GroupBy(c => c.UserId.ToString())
+                .ToDictionary(g => g.Key, g => g.First().DisplayName!);
+
             var messages = await Task.Run(() =>
-                _databaseService.GetMessages(SelectedContact.UserId, 1000));
+                _databaseService.GetMessages(contact.UserId, 1000, contact.DisplayName, senderNames));
+            var error = _databaseService.LastError;
 
             Messages.Clear();
             foreach (var message in messages)
@@ -282,7 +382,16 @@ public partial class MainWindowViewModel : ObservableObject
             }
 
             MessageCount = Messages.Count;
-            StatusMessage = $"Loaded {MessageCount} messages";
+
+            if (error is not null)
+            {
+                Log.Error("Message load reported an error: {Error}", error);
+                StatusMessage = error;
+            }
+            else
+            {
+                StatusMessage = $"Loaded {MessageCount} messages";
+            }
         }
         catch (Exception ex)
         {
@@ -405,15 +514,6 @@ public partial class MainWindowViewModel : ObservableObject
         {
             Log.Error(ex, "Failed to disconnect");
             StatusMessage = "Failed to disconnect";
-        }
-    }
-
-    [RelayCommand]
-    private void Refresh()
-    {
-        if (IsConnected)
-        {
-            LoadContactsCommand.Execute(null);
         }
     }
 

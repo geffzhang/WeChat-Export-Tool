@@ -150,6 +150,44 @@ public static class CryptoUtils
     }
 
     /// <summary>
+    /// Normalises a user-supplied WeChat decryption key into the 64-character
+    /// lowercase hex form that SQLCipher's raw-key syntax expects.
+    /// </summary>
+    /// <remarks>
+    /// WeChat stores a raw 32-byte key, conventionally presented as 64 hex
+    /// characters. SQLCipher must receive those bytes directly:
+    /// <c>PRAGMA key = "x'&lt;64 hex chars&gt;'"</c>. This is deliberately NOT the
+    /// same thing as a passphrase: SQLCipher runs a PBKDF2 derivation over the
+    /// supplied key material either way, but a passphrase is first hashed as text,
+    /// which produces a completely different key and fails to open the database.
+    /// Hence callers must not route a 64-hex WeChat key through the connection
+    /// string <c>Password</c> keyword, and must not pass derived MD5 bytes here.
+    /// </remarks>
+    /// <param name="key">The user-supplied key (may have surrounding whitespace or a 0x prefix).</param>
+    /// <param name="normalizedHex">The 64-character lowercase hex key when this returns true.</param>
+    /// <returns>True if <paramref name="key"/> is a 64-hex-character raw WeChat key.</returns>
+    public static bool TryNormalizeHexKey(string? key, out string? normalizedHex)
+    {
+        normalizedHex = null;
+
+        if (string.IsNullOrWhiteSpace(key))
+            return false;
+
+        var candidate = key.Trim();
+
+        // Tolerate the "0x" prefix some key-extraction tools print.
+        if (candidate.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            candidate = candidate[2..];
+
+        // A WeChat raw key is exactly 32 bytes == 64 hex chars.
+        if (candidate.Length != 64 || !IsHexString(candidate))
+            return false;
+
+        normalizedHex = candidate.ToLowerInvariant();
+        return true;
+    }
+
+    /// <summary>
     /// Checks if a string is a valid hex string.
     /// </summary>
     public static bool IsHexString(string s)

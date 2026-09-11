@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -25,6 +26,41 @@ public class ExportService
         QuestPDF.Settings.License = LicenseType.Community;
     }
 
+    /// <summary>
+    /// The sender label shown in every export format. Self-authored messages are
+    /// always "You" so all six formats agree, rather than only TXT/HTML/PDF.
+    /// </summary>
+    private static string GetSenderLabel(Message message)
+    {
+        if (message.IsFromSelf)
+            return "You";
+
+        return string.IsNullOrWhiteSpace(message.SenderName) ? "Unknown" : message.SenderName;
+    }
+
+    /// <summary>
+    /// Quotes a CSV field, doubling any embedded quotes. Applied to every field
+    /// (not just Content) so a chat name or type can never break the column layout.
+    /// </summary>
+    private static string CsvField(string? value)
+    {
+        return $"\"{(value ?? string.Empty).Replace("\"", "\"\"")}\"";
+    }
+
+    /// <summary>
+    /// HTML-encodes user content, then converts newlines to &lt;br&gt;. Escaping
+    /// happens first so the inserted markup is ours and the message text cannot
+    /// inject tags or script into the export.
+    /// </summary>
+    private static string HtmlText(string? value)
+    {
+        var encoded = WebUtility.HtmlEncode(value ?? string.Empty);
+        return encoded
+            .Replace("\r\n", "<br>")
+            .Replace("\n", "<br>")
+            .Replace("\r", "<br>");
+    }
+
     public void ExportToJson(Conversation conversation, string outputPath)
     {
         try
@@ -35,7 +71,7 @@ public class ExportService
                 Messages = conversation.Messages.Select(m => new
                 {
                     m.MessageId,
-                    m.SenderName,
+                    SenderName = GetSenderLabel(m),
                     m.Content,
                     Type = m.Type.ToString(),
                     m.CreateTime,
@@ -67,12 +103,16 @@ public class ExportService
         try
         {
             var sb = new StringBuilder();
-            sb.AppendLine("Time,Sender,Content,Type,FromSelf");
+            sb.AppendLine(string.Join(",", new[] { "Time", "Sender", "Content", "Type", "FromSelf" }.Select(CsvField)));
 
             foreach (var msg in conversation.Messages)
             {
-                var content = msg.Content?.Replace("\"", "\"\"") ?? "";
-                sb.AppendLine($"\"{msg.CreateTime:yyyy-MM-dd HH:mm:ss}\",\"{msg.SenderName}\",\"{content}\",\"{msg.Type}\",\"{msg.IsFromSelf}\"");
+                sb.AppendLine(string.Join(",",
+                    CsvField(msg.CreateTime.ToString("yyyy-MM-dd HH:mm:ss")),
+                    CsvField(GetSenderLabel(msg)),
+                    CsvField(msg.Content),
+                    CsvField(msg.Type.ToString()),
+                    CsvField(msg.IsFromSelf.ToString())));
             }
 
             File.WriteAllText(outputPath, sb.ToString(), Encoding.UTF8);
@@ -96,7 +136,7 @@ public class ExportService
 
             foreach (var msg in conversation.Messages.OrderBy(m => m.CreateTime))
             {
-                var sender = msg.IsFromSelf ? "You" : (msg.SenderName ?? "Unknown");
+                var sender = GetSenderLabel(msg);
                 sb.AppendLine($"[{msg.CreateTime:yyyy-MM-dd HH:mm:ss}] {sender}:");
                 sb.AppendLine($"  {msg.Content}");
                 sb.AppendLine();
@@ -129,16 +169,16 @@ public class ExportService
             sb.AppendLine(".sender { font-weight: bold; font-size: 12px; }");
             sb.AppendLine("</style></head><body>");
 
-            sb.AppendLine($"<h1>Chat with: {conversation.Contact.DisplayName}</h1>");
+            sb.AppendLine($"<h1>Chat with: {WebUtility.HtmlEncode(conversation.Contact.DisplayName ?? string.Empty)}</h1>");
 
             foreach (var msg in conversation.Messages.OrderBy(m => m.CreateTime))
             {
                 var cssClass = msg.IsFromSelf ? "self" : "other";
-                var sender = msg.IsFromSelf ? "You" : (msg.SenderName ?? "Unknown");
+                var sender = GetSenderLabel(msg);
 
                 sb.AppendLine($"<div class='message {cssClass}'>");
-                sb.AppendLine($"<div class='sender'>{sender}</div>");
-                sb.AppendLine($"<div>{msg.Content?.Replace("\n", "<br>")}</div>");
+                sb.AppendLine($"<div class='sender'>{WebUtility.HtmlEncode(sender)}</div>");
+                sb.AppendLine($"<div>{HtmlText(msg.Content)}</div>");
                 sb.AppendLine($"<div class='time'>{msg.CreateTime:yyyy-MM-dd HH:mm:ss}</div>");
                 sb.AppendLine("</div>");
             }
@@ -176,7 +216,7 @@ public class ExportService
             foreach (var msg in conversation.Messages.OrderBy(m => m.CreateTime))
             {
                 worksheet.Cell(row, 1).Value = msg.CreateTime.ToString("yyyy-MM-dd HH:mm:ss");
-                worksheet.Cell(row, 2).Value = msg.SenderName ?? "Unknown";
+                worksheet.Cell(row, 2).Value = GetSenderLabel(msg);
                 worksheet.Cell(row, 3).Value = msg.Content ?? "";
                 worksheet.Cell(row, 4).Value = msg.Type.ToString();
                 worksheet.Cell(row, 5).Value = msg.IsFromSelf ? "Yes" : "No";
@@ -216,7 +256,7 @@ public class ExportService
                     {
                         foreach (var msg in messages)
                         {
-                            var sender = msg.IsFromSelf ? "You" : (msg.SenderName ?? "Unknown");
+                            var sender = GetSenderLabel(msg);
                             var bgColor = msg.IsFromSelf ? Colors.Grey.Lighten4 : Colors.White;
 
                             column.Item().Background(bgColor).Padding(10).Column(msgCol =>

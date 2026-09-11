@@ -1,16 +1,63 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Microsoft.Data.Sqlite;
 using Serilog;
+using WeChatExport.Core.Decryption;
 using WeChatExport.Core.Models;
 
 namespace WeChatExport.Services;
 
+/// <summary>
+/// Distinguishes the ways a connect attempt can end, so the UI can tell the user
+/// what actually went wrong instead of collapsing everything into "0 contacts".
+/// </summary>
+public enum ConnectOutcome
+{
+    /// <summary>The database was opened, decrypted and contains the expected tables.</summary>
+    Success,
+
+    /// <summary>No path was supplied.</summary>
+    InvalidPath,
+
+    /// <summary>The path does not exist on disk.</summary>
+    FileNotFound,
+
+    /// <summary>The key was wrong (or the file is encrypted and the key was missing).</summary>
+    KeyRejected,
+
+    /// <summary>The file opened but is not a SQLite/SQLCipher database we can read.</summary>
+    NotADatabase,
+
+    /// <summary>Opened and decrypted, but the tables this app reads are absent.</summary>
+    MissingExpectedTables,
+
+    /// <summary>Anything else (I/O error, provider error, ...).</summary>
+    Failed
+}
+
+/// <summary>Outcome of a connect attempt plus a user-facing explanation.</summary>
+public readonly record struct ConnectResult(ConnectOutcome Outcome, string Message)
+{
+    public bool IsSuccess => Outcome == ConnectOutcome.Success;
+}
+
 public class DatabaseService : IDisposable
 {
+    private const int SqliteNotADatabase = 26; // SQLITE_NOTADB
+
+    /// <summary>
+    /// Tables this app actually reads out of a MSG database. A real WeChat MSG*.db
+    /// uses different table names, so a mismatch surfaces as
+    /// <see cref="ConnectOutcome.MissingExpectedTables"/> rather than a silent
+    /// "0 contacts" - see the honest-failure handling in Connect().
+    /// </summary>
+    private static readonly string[] ExpectedMsgTables = { "ChatInfo" };
+
     private SqliteConnection? _connection;
     private string? _databasePath;
+    private string? _rawHexKey;
     private bool _disposed;
 
     public bool IsConnected => _connection?.State == System.Data.ConnectionState.Open;
@@ -18,97 +65,168 @@ public class DatabaseService : IDisposable
     public string? DatabasePath => _databasePath;
 
     /// <summary>
-    /// Connects to a WeChat database file (MSG.db or MicroMsg.db)
+    /// Set when a query method fails, so callers can distinguish "there was
+    /// genuinely nothing to return" from "the read blew up and we swallowed it".
+    /// Cleared at the start of every query.
     /// </summary>
-    /// <param name="dbPath">Path to the database file</param>
-    /// <returns>True if connection successful</returns>
-    public bool Connect(string dbPath)
+    public string? LastError { get; private set; }
+
+    /// <summary>
+    /// Connects to a WeChat database file (MSG.db or MicroMsg.db).
+    /// </summary>
+    /// <param name="dbPath">Path to the database file.</param>
+    /// <param name="key">
+    /// Optional decryption key. A 64-hex-character value is treated as WeChat's raw
+    /// 32-byte SQLCipher key; anything else is treated as a passphrase.
+    /// </param>
+    public ConnectResult Connect(string dbPath, string? key = null)
     {
+        if (string.IsNullOrWhiteSpace(dbPath))
+        {
+            Log.Warning("Database path is null or empty");
+            return new ConnectResult(ConnectOutcome.InvalidPath, "No database path was supplied.");
+        }
+
+        if (!File.Exists(dbPath))
+        {
+            Log.Warning("Database file not found: {DbPath}", dbPath);
+            return new ConnectResult(ConnectOutcome.FileNotFound, $"Database file not found: {dbPath}");
+        }
+
+        Disconnect();
+
+        // Declared outside the try: the catch clauses below need it to tell "wrong
+        // key" apart from "not a database at all".
+        var hasKey = !string.IsNullOrWhiteSpace(key);
+
         try
         {
-            if (string.IsNullOrEmpty(dbPath))
-            {
-                Log.Warning("Database path is null or empty");
-                return false;
-            }
-
-            if (!File.Exists(dbPath))
-            {
-                Log.Warning("Database file not found: {DbPath}", dbPath);
-                return false;
-            }
-
-            Disconnect();
-
-            _databasePath = dbPath;
+            // WeChat MSG*.db files are SQLCipher v4 databases whose key is a raw
+            // 32-byte value, normally written as 64 hex characters. The matching
+            // derivation is PBKDF2-HMAC-SHA512(rawKey, dbSalt, 256000) - which is
+            // exactly what SQLCipher does with a raw key, and NOT what it does with
+            // a passphrase. So a 64-hex key must go through SQLCipher's raw-key
+            // syntax, issued as the first statement on the connection:
+            //     PRAGMA key = "x'<64 hex chars>'"
+            // Only non-hex input is treated as a passphrase, via
+            // SqliteConnectionStringBuilder.Password (which maps to sqlite3_key with
+            // text semantics). Passing a hex WeChat key as Password silently derives
+            // a different key and fails with SQLITE_NOTADB - verified in the fix
+            // harness, so it is not merely a theoretical concern.
             var connectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = dbPath,
                 Mode = SqliteOpenMode.ReadOnly
-            }.ToString();
+            };
 
-            _connection = new SqliteConnection(connectionString);
+            _rawHexKey = null;
+            if (hasKey)
+            {
+                if (CryptoUtils.TryNormalizeHexKey(key, out var normalizedHex))
+                {
+                    _rawHexKey = normalizedHex;
+                }
+                else
+                {
+                    connectionString.Password = key;
+                }
+
+                // A keyed connection must NOT be pooled. The raw-hex key is applied
+                // by a PRAGMA, so it is not part of the connection string and
+                // therefore not part of Microsoft.Data.Sqlite's pool key. A pooled
+                // connection keeps whichever key it was first opened with, so a
+                // later Connect() with a different (even wrong) key would silently
+                // reuse it and appear to succeed. Verified in the fix harness.
+                connectionString.Pooling = false;
+            }
+
+            _connection = new SqliteConnection(connectionString.ToString());
             _connection.Open();
 
-            Log.Information("Connected to WeChat database: {DbPath}", dbPath);
-            return true;
+            if (_rawHexKey is not null)
+            {
+                using var keyCommand = _connection.CreateCommand();
+                keyCommand.CommandText = $"PRAGMA key = \"x'{_rawHexKey}'\";";
+                keyCommand.ExecuteNonQuery();
+            }
+
+            // Opening proves nothing on its own: SQLite defers reading the header
+            // until the first statement, so a wrong key or a non-database file only
+            // fails here. Probe cheaply and report honestly.
+            //
+            // Depending on the mechanism, a bad key surfaces either at Open() (the
+            // connection-string Password keyword is validated eagerly) or at this
+            // first read (the raw-hex PRAGMA form is not), so both are covered by the
+            // SQLITE_NOTADB catch clauses around this whole block.
+            using (var probe = _connection.CreateCommand())
+            {
+                probe.CommandText = "SELECT count(*) FROM sqlite_master;";
+                probe.ExecuteScalar();
+            }
+
+            using (var tableProbe = _connection.CreateCommand())
+            {
+                tableProbe.CommandText =
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN (" +
+                    string.Join(", ", ExpectedMsgTables.Select((_, i) => $"@t{i}")) + ");";
+
+                for (var i = 0; i < ExpectedMsgTables.Length; i++)
+                    tableProbe.Parameters.AddWithValue($"@t{i}", ExpectedMsgTables[i]);
+
+                if (Convert.ToInt32(tableProbe.ExecuteScalar()) == 0)
+                {
+                    Log.Warning(
+                        "Connected to {DbPath} but found none of the expected tables ({Tables})",
+                        dbPath,
+                        string.Join(", ", ExpectedMsgTables));
+                    DisposeConnection();
+
+                    return new ConnectResult(
+                        ConnectOutcome.MissingExpectedTables,
+                        $"The database opened, but it has none of the tables this app reads ({string.Join(", ", ExpectedMsgTables)}). The schema is probably a different WeChat version.");
+                }
+            }
+
+            _databasePath = dbPath;
+            Log.Information("Connected to WeChat database: {DbPath} (key applied: {HasKey})", dbPath, hasKey);
+            return new ConnectResult(ConnectOutcome.Success, "Connected successfully");
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == SqliteNotADatabase)
+        {
+            // SQLITE_NOTADB means the file could not be read as a database: either
+            // the key is wrong, or the file is encrypted and no key was supplied.
+            Log.Error(ex, "Database is not readable with the supplied key: {DbPath}", dbPath);
+            DisposeConnection();
+
+            return hasKey
+                ? new ConnectResult(
+                    ConnectOutcome.KeyRejected,
+                    "The database could not be decrypted with the supplied key. Check the key, or clear it if the file is not encrypted.")
+                : new ConnectResult(
+                    ConnectOutcome.NotADatabase,
+                    "The file could not be read as a database. It looks encrypted - supply the decryption key.");
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to connect to database: {DbPath}", dbPath);
-            return false;
+            DisposeConnection();
+            return new ConnectResult(ConnectOutcome.Failed, $"Connection failed: {ex.Message}");
         }
     }
 
     /// <summary>
-    /// Connects to the default WeChat MSG database in the user's WeChat data folder
-    /// </summary>
-    /// <returns>True if connection successful</returns>
-    public bool ConnectToDefaultDatabase()
-    {
-        var defaultPath = GetDefaultMsgDatabasePath();
-        if (string.IsNullOrEmpty(defaultPath) || !File.Exists(defaultPath))
-        {
-            Log.Warning("Default WeChat MSG database not found");
-            return false;
-        }
-
-        return Connect(defaultPath);
-    }
-
-    /// <summary>
-    /// Gets the default path to WeChat's MSG database
-    /// </summary>
-    public string? GetDefaultMsgDatabasePath()
-    {
-        var appDataPath = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        var weChatPath = Path.Combine(appDataPath, "Tencent", "WeChat", "Msg");
-
-        if (Directory.Exists(weChatPath))
-        {
-            var files = Directory.GetFiles(weChatPath, "Msg*.db");
-            if (files.Length > 0)
-            {
-                // Return the most recent MSG database
-                Array.Sort(files, (a, b) => File.GetLastWriteTime(b).CompareTo(File.GetLastWriteTime(a)));
-                return files[0];
-            }
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Gets all contacts from the WeChat database
+    /// Gets all contacts from the WeChat database.
     /// </summary>
     /// <returns>List of contacts</returns>
     public List<Contact> GetContacts()
     {
+        LastError = null;
         var contacts = new List<Contact>();
 
         if (_connection == null || !IsConnected)
         {
             Log.Warning("Not connected to database");
+            LastError = "Not connected to a database.";
             return contacts;
         }
 
@@ -127,11 +245,17 @@ public class DatabaseService : IDisposable
                 contacts = GetContactsFromMsgDb(_databasePath);
             }
 
+            if (contacts.Count == 0 && LastError is null)
+            {
+                LastError = "The database contains no readable contacts in the expected tables.";
+            }
+
             Log.Information("Retrieved {Count} contacts from database", contacts.Count);
         }
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to retrieve contacts");
+            LastError = $"Failed to read contacts: {ex.Message}";
         }
 
         return contacts;
@@ -142,23 +266,25 @@ public class DatabaseService : IDisposable
         if (string.IsNullOrEmpty(_databasePath))
             return null;
 
-        // MSG.db is in AppData\Roaming\Tencent\WeChat\Msg\
-        // MicroMsg.db is in AppData\Roaming\Tencent\WeChat\MicroMsg\
         var msgDir = Path.GetDirectoryName(_databasePath);
         if (string.IsNullOrEmpty(msgDir))
             return null;
 
-        var weChatDir = Path.GetDirectoryName(msgDir);
-        if (string.IsNullOrEmpty(weChatDir))
+        // WeChat 3.x keeps MicroMsg.db beside the MSG*.db files (in the Msg folder).
+        var sibling = Path.Combine(msgDir, "MicroMsg.db");
+        if (File.Exists(sibling))
+            return sibling;
+
+        // Some layouts nest it one level up, in a per-account MicroMsg folder.
+        var accountDir = Path.GetDirectoryName(msgDir);
+        if (string.IsNullOrEmpty(accountDir))
             return null;
 
-        var microMsgDir = Path.Combine(weChatDir, "MicroMsg");
+        var microMsgDir = Path.Combine(accountDir, "MicroMsg");
         if (!Directory.Exists(microMsgDir))
             return null;
 
-        // Find the user folder (usually a long hexadecimal folder name)
-        var userDirs = Directory.GetDirectories(microMsgDir);
-        foreach (var userDir in userDirs)
+        foreach (var userDir in Directory.GetDirectories(microMsgDir))
         {
             var msgDb = Path.Combine(userDir, "MicroMsg.db");
             if (File.Exists(msgDb))
@@ -174,14 +300,8 @@ public class DatabaseService : IDisposable
 
         try
         {
-            var connectionString = new SqliteConnectionStringBuilder
-            {
-                DataSource = dbPath,
-                Mode = SqliteOpenMode.ReadOnly
-            }.ToString();
-
-            using var connection = new SqliteConnection(connectionString);
-            connection.Open();
+            // MicroMsg.db is itself a SQLCipher database, so it needs the same key.
+            using var connection = CreateConnection(dbPath);
 
             // Try to get contacts from MicroMsg.db
             // Contact table structure varies by WeChat version
@@ -218,7 +338,8 @@ public class DatabaseService : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "Failed to read contacts from MicroMsg.db");
+            Log.Error(ex, "Failed to read contacts from MicroMsg.db");
+            LastError = $"Failed to read contacts from MicroMsg.db: {ex.Message}";
         }
 
         return contacts;
@@ -271,31 +392,50 @@ public class DatabaseService : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "Failed to read contacts from MSG.db");
+            Log.Error(ex, "Failed to read contacts from MSG.db");
+            LastError = $"Failed to read contacts from MSG.db: {ex.Message}";
         }
 
         return contacts;
     }
 
     /// <summary>
-    /// Gets messages from a specific conversation
+    /// Gets messages from a specific conversation.
     /// </summary>
-    /// <param name="contactId">The contact/user ID</param>
-    /// <param name="limit">Maximum number of messages to retrieve (default 1000)</param>
+    /// <param name="contactId">The contact/user ID.</param>
+    /// <param name="limit">Maximum number of messages to retrieve (default 1000).</param>
+    /// <param name="conversationDisplayName">
+    /// Display name of the conversation's contact. Used to fill in
+    /// <see cref="Message.SenderName"/> for the other party, so the UI and every
+    /// export show a real name instead of a blank/"Unknown" sender.
+    /// </param>
+    /// <param name="senderNames">
+    /// Optional per-sender lookup (sender identifier as stored in the database,
+    /// e.g. a wxid, mapped to a contact display name). When a message's sender is
+    /// present here it wins over <paramref name="conversationDisplayName"/>; this is
+    /// what lets a group conversation attribute each message to the right person.
+    /// </param>
     /// <returns>List of messages</returns>
-    public List<Message> GetMessages(long contactId, int limit = 1000)
+    public List<Message> GetMessages(
+        long contactId,
+        int limit = 1000,
+        string? conversationDisplayName = null,
+        IReadOnlyDictionary<string, string>? senderNames = null)
     {
+        LastError = null;
         var messages = new List<Message>();
 
         if (_connection == null || !IsConnected)
         {
             Log.Warning("Not connected to database");
+            LastError = "Not connected to a database.";
             return messages;
         }
 
         try
         {
-            // Try to get messages from MSG.db
+            // Try to get messages from MSG.db. Sender is selected so the sender can
+            // be resolved to a contact name rather than left blank.
             var query = @"
                 SELECT
                     LocalID,
@@ -304,7 +444,8 @@ public class DatabaseService : IDisposable
                     Content,
                     MessageType,
                     Des,
-                    FileName
+                    FileName,
+                    Sender
                 FROM ChatInfo
                 WHERE (Sender = @ContactId OR Receiver = @ContactId)
                 ORDER BY CreateTime DESC
@@ -318,14 +459,24 @@ public class DatabaseService : IDisposable
 
             while (reader.Read())
             {
+                var isFromSelf = reader.GetInt32(2) == 1;
+
                 var message = new Message
                 {
                     MessageId = reader.GetInt64(0),
                     CreateTime = DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(1)).LocalDateTime,
-                    IsFromSelf = reader.GetInt32(2) == 1,
+                    IsFromSelf = isFromSelf,
                     Content = reader.IsDBNull(3) ? null : reader.GetString(3),
                     Type = (MessageType)reader.GetInt32(4),
-                    SenderId = reader.GetInt32(2) == 1 ? 0 : contactId
+                    SenderId = isFromSelf ? 0 : contactId,
+                    // Only the other party needs a name: the UI and the exports render
+                    // self-authored messages as "You".
+                    SenderName = isFromSelf
+                        ? null
+                        : ResolveSenderName(
+                            reader.IsDBNull(7) ? null : reader.GetString(7),
+                            conversationDisplayName,
+                            senderNames)
                 };
 
                 // Handle message type-specific data (media paths, etc.)
@@ -349,176 +500,66 @@ public class DatabaseService : IDisposable
         catch (Exception ex)
         {
             Log.Error(ex, "Failed to retrieve messages for contact {ContactId}", contactId);
+            LastError = $"Failed to read messages: {ex.Message}";
         }
 
         return messages;
     }
 
     /// <summary>
-    /// Gets all messages from the database
+    /// Picks the best available display name for a message's sender.
     /// </summary>
-    /// <param name="limit">Maximum number of messages to retrieve per conversation</param>
-    /// <returns>List of all messages</returns>
-    public List<Message> GetAllMessages(int limit = 1000)
+    /// <remarks>
+    /// Preference order: an explicit per-sender mapping first (accurate for group
+    /// chats), then the conversation's contact name. The fallback matters because
+    /// without it every message from the other party renders as blank/"Unknown".
+    /// </remarks>
+    private static string? ResolveSenderName(
+        string? senderId,
+        string? conversationDisplayName,
+        IReadOnlyDictionary<string, string>? senderNames)
     {
-        var messages = new List<Message>();
-
-        if (_connection == null || !IsConnected)
+        if (senderNames is not null
+            && !string.IsNullOrEmpty(senderId)
+            && senderNames.TryGetValue(senderId, out var mapped)
+            && !string.IsNullOrWhiteSpace(mapped))
         {
-            Log.Warning("Not connected to database");
-            return messages;
+            return mapped;
         }
 
-        try
-        {
-            var query = @"
-                SELECT
-                    LocalID,
-                    CreateTime,
-                    IsSender,
-                    Content,
-                    MessageType,
-                    Des,
-                    FileName,
-                    Sender,
-                    Receiver
-                FROM ChatInfo
-                ORDER BY CreateTime DESC
-                LIMIT @Limit";
-
-            using var cmd = new SqliteCommand(query, _connection);
-            cmd.Parameters.AddWithValue("@Limit", limit);
-
-            using var reader = cmd.ExecuteReader();
-
-            while (reader.Read())
-            {
-                var message = new Message
-                {
-                    MessageId = reader.GetInt64(0),
-                    CreateTime = DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(1)).LocalDateTime,
-                    IsFromSelf = reader.GetInt32(2) == 1,
-                    Content = reader.IsDBNull(3) ? null : reader.GetString(3),
-                    Type = (MessageType)reader.GetInt32(4)
-                };
-
-                // Determine sender ID
-                if (!reader.IsDBNull(7))
-                {
-                    var senderStr = reader.GetString(7);
-                    if (long.TryParse(senderStr, out var senderId))
-                    {
-                        message.SenderId = senderId;
-                    }
-                }
-
-                // Handle media paths
-                if (!reader.IsDBNull(5))
-                {
-                    var des = reader.GetString(5);
-                    if (!string.IsNullOrEmpty(des))
-                    {
-                        message.MediaPath = des;
-                    }
-                }
-
-                messages.Add(message);
-            }
-
-            // Reverse to get chronological order
-            messages.Reverse();
-
-            Log.Information("Retrieved {Count} messages from database", messages.Count);
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Failed to retrieve all messages");
-        }
-
-        return messages;
+        return string.IsNullOrWhiteSpace(conversationDisplayName) ? null : conversationDisplayName;
     }
 
     /// <summary>
-    /// Gets message count from a specific conversation
+    /// Builds a connection to <paramref name="dbPath"/>, applying the same key
+    /// (raw-hex pragma or passphrase) that was used for the main connection.
     /// </summary>
-    /// <param name="contactId">The contact/user ID</param>
-    /// <returns>Number of messages</returns>
-    public int GetMessageCount(long contactId)
+    private SqliteConnection CreateConnection(string dbPath)
     {
-        if (_connection == null || !IsConnected)
+        var builder = new SqliteConnectionStringBuilder
         {
-            return 0;
+            DataSource = dbPath,
+            Mode = SqliteOpenMode.ReadOnly
+        };
+
+        if (_rawHexKey is not null)
+        {
+            // See Connect(): the key is applied by PRAGMA, so the connection must not
+            // be pooled or a differently-keyed open could reuse it.
+            builder.Pooling = false;
         }
 
-        try
-        {
-            var query = "SELECT COUNT(*) FROM ChatInfo WHERE Sender = @ContactId OR Receiver = @ContactId";
-            using var cmd = new SqliteCommand(query, _connection);
-            cmd.Parameters.AddWithValue("@ContactId", contactId.ToString());
+        var connection = new SqliteConnection(builder.ToString());
+        connection.Open();
 
-            var result = cmd.ExecuteScalar();
-            return Convert.ToInt32(result);
-        }
-        catch (Exception ex)
+        if (_rawHexKey is not null)
         {
-            Log.Error(ex, "Failed to get message count for contact {ContactId}", contactId);
-            return 0;
-        }
-    }
-
-    /// <summary>
-    /// Gets a list of all conversations with their last message info
-    /// </summary>
-    /// <returns>List of contacts with conversation info</returns>
-    public List<Contact> GetConversations()
-    {
-        var conversations = new List<Contact>();
-
-        if (_connection == null || !IsConnected)
-        {
-            Log.Warning("Not connected to database");
-            return conversations;
+            using var keyCommand = connection.CreateCommand();
+            keyCommand.CommandText = $"PRAGMA key = \"x'{_rawHexKey}'\";";
+            keyCommand.ExecuteNonQuery();
         }
 
-        try
-        {
-            var query = @"
-                SELECT
-                    CASE
-                        WHEN Receiver IS NOT NULL AND Receiver != '' THEN CAST(Receiver AS INTEGER)
-                        ELSE 0
-                    END as ContactId,
-                    MAX(CreateTime) as LastMessageTime,
-                    COUNT(*) as MessageCount
-                FROM ChatInfo
-                WHERE Receiver IS NOT NULL AND Receiver != ''
-                GROUP BY ContactId
-                ORDER BY LastMessageTime DESC";
-
-            using var cmd = new SqliteCommand(query, _connection);
-            using var reader = cmd.ExecuteReader();
-
-            while (reader.Read())
-            {
-                var contactId = reader.GetInt64(0);
-                if (contactId > 0)
-                {
-                    conversations.Add(new Contact
-                    {
-                        UserId = contactId,
-                        LastMessageTime = DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(1)).LocalDateTime
-                    });
-                }
-            }
-
-            Log.Information("Retrieved {Count} conversations", conversations.Count);
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Failed to retrieve conversations");
-        }
-
-        return conversations;
+        return connection;
     }
 
     /// <summary>
@@ -532,11 +573,9 @@ public class DatabaseService : IDisposable
             {
                 if (_connection.State == System.Data.ConnectionState.Open)
                 {
-                    _connection.Close();
                     Log.Information("Disconnected from database: {DbPath}", _databasePath);
                 }
-                _connection.Dispose();
-                _connection = null;
+                DisposeConnection();
             }
         }
         catch (Exception ex)
@@ -546,45 +585,14 @@ public class DatabaseService : IDisposable
         finally
         {
             _databasePath = null;
+            _rawHexKey = null;
         }
     }
 
-    /// <summary>
-    /// Executes a raw SQL query and returns results
-    /// </summary>
-    /// <param name="query">SQL query to execute</param>
-    /// <returns>List of dictionaries containing row data</returns>
-    public List<Dictionary<string, object?>> ExecuteQuery(string query)
+    private void DisposeConnection()
     {
-        var results = new List<Dictionary<string, object?>>();
-
-        if (_connection == null || !IsConnected)
-        {
-            Log.Warning("Not connected to database");
-            return results;
-        }
-
-        try
-        {
-            using var cmd = new SqliteCommand(query, _connection);
-            using var reader = cmd.ExecuteReader();
-
-            while (reader.Read())
-            {
-                var row = new Dictionary<string, object?>();
-                for (int i = 0; i < reader.FieldCount; i++)
-                {
-                    row[reader.GetName(i)] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                }
-                results.Add(row);
-            }
-        }
-        catch (Exception ex)
-        {
-            Log.Error(ex, "Failed to execute query: {Query}", query);
-        }
-
-        return results;
+        _connection?.Dispose();
+        _connection = null;
     }
 
     public void Dispose()

@@ -29,7 +29,7 @@
                            Margin="0,0,10,0"/>
                 <TextBox Grid.Column="1"
                          Text="{Binding WeChatPath}"
-                         PlaceholderText="Select WeChat installation folder..."
+                         PlaceholderText="WeChat data folder (e.g. Documents\WeChat Files) - searched first"
                          VerticalAlignment="Center"
                          Margin="0,0,10,0"/>
 
@@ -52,6 +52,11 @@
                             Spacing="10">
                     <Button Content="Browse"
                             Command="{Binding BrowseWeChatPathCommand}"
+                            ToolTip.Tip="Choose the WeChat data folder"
+                            Padding="15,8"/>
+                    <Button Content="Capture key"
+                            Command="{Binding CaptureKeyCommand}"
+                            ToolTip.Tip="Try to read the decryption key from a running WeChat process. Automatic capture is not implemented yet - this reports whether WeChat is running."
                             Padding="15,8"/>
                     <!-- IsEnabled is driven by the command's CanExecute (Avalonia ANDs
                          IsEnabledCore with CanExecute); do not override it here. -->
@@ -193,14 +198,24 @@
                     </ListBox.ItemTemplate>
                 </ListBox>
 
-                <!-- Empty State -->
+                <!-- Empty States. Two separate hints: the connection-oriented one
+                     while disconnected, and the "pick a conversation" one once
+                     connected with nothing selected. Previously a single hint used
+                     the wrong text in both situations. -->
+                <TextBlock Grid.Row="1"
+                           Text="Not connected - choose a WeChat data folder and click Connect"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           Foreground="Gray"
+                           FontSize="16"
+                           IsVisible="{Binding ShowConnectHint}"/>
                 <TextBlock Grid.Row="1"
                            Text="Select a contact to view messages"
                            HorizontalAlignment="Center"
                            VerticalAlignment="Center"
                            Foreground="Gray"
                            FontSize="16"
-                           IsVisible="{Binding !IsConnected}"/>
+                           IsVisible="{Binding ShowSelectContactHint}"/>
             </Grid>
         </Grid>
 

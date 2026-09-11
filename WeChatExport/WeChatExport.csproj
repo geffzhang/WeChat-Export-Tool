@@ -37,7 +37,13 @@
     <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.2" />
     <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.2" />
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.3.2" />
-    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.11" />
+    <!-- Microsoft.Data.Sqlite.Core (not the Microsoft.Data.Sqlite metapackage) so
+         the SQLite native provider is chosen explicitly: WeChat's MSG*.db files are
+         SQLCipher v4 databases, and the default bundle_e_sqlite3 build of SQLite
+         cannot read them at all. See Services/DatabaseService.cs for how the key is
+         applied. -->
+    <PackageReference Include="Microsoft.Data.Sqlite.Core" Version="8.0.11" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlcipher" Version="2.1.11" />
     <PackageReference Include="ClosedXML" Version="0.104.1" />
     <PackageReference Include="QuestPDF" Version="2026.2.0" />
     <PackageReference Include="Serilog" Version="4.1.0" />
