@@ -24,10 +24,14 @@
 
   <!-- QuestPDF's package ships a LatoFont/ folder (19 .ttf files) as None items
        copied to the output and publish directories, via its own QuestPDF.targets.
-       This app never references Lato (Avalonia uses Inter and QuestPDF's own
-       rendering uses its embedded fonts), so drop those items before the copy
-       targets see them - it otherwise doubles the size of the shipped folder
-       beside the single-file exe. -->
+       "Lato" is QuestPDF's default font FAMILY NAME, resolved from disk when the
+       folder is present; it is not an embedded font (QuestPDF.dll contains the
+       string "Lato" once, and no LatoFont/Lato-Regular font data). This app does
+       not select that family - Avalonia renders with Inter, and the PDF export
+       never asks for Lato - so the folder is dead weight. Verified by rendering a
+       PDF with the folder absent. Dropped here before the copy targets see them;
+       it otherwise doubles the size of the shipped folder beside the single-file
+       exe. -->
   <Target Name="RemoveUnusedQuestPdfFonts" BeforeTargets="AssignTargetPaths">
     <ItemGroup>
       <None Remove="@(None)"

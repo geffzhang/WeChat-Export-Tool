@@ -17,6 +17,15 @@ namespace WeChatExport.Services;
 /// </summary>
 public enum ConnectOutcome
 {
+    /// <summary>
+    /// Not a real outcome: the value an uninitialised <see cref="ConnectResult"/>
+    /// carries. It exists so that <c>default(ConnectResult)</c> - whose Outcome is
+    /// this zero member and whose Message is null - is a FAILURE rather than a
+    /// success. With <see cref="Success"/> at zero, <c>default(ConnectResult).IsSuccess</c>
+    /// was <c>true</c>.
+    /// </summary>
+    Unknown = 0,
+
     /// <summary>The database was opened, decrypted and contains the expected tables.</summary>
     Success,
 
@@ -59,9 +68,6 @@ public class DatabaseService : IDisposable
     /// </summary>
     private const int SqlCipherSaltSize = 16;
 
-    /// <summary>SQLCipher 4's default page size; a candidate using it needs no PRAGMA.</summary>
-    private const int SqlCipherDefaultPageSize = 4096;
-
     /// <summary>How many discovered table names to name in a schema-mismatch message.</summary>
     private const int DiscoveredTableListLimit = 15;
 
@@ -78,42 +84,62 @@ public class DatabaseService : IDisposable
     /// One SQLCipher parameter set that WeChat has shipped. The key is derived with
     /// this candidate's KDF and handed to SQLCipher as an already-derived raw key.
     /// </summary>
+    /// <remarks>
+    /// There is deliberately no page-size field. The remaining candidate's 4096 is
+    /// SQLCipher 4's own default, so it needs no PRAGMA. The old
+    /// <c>PRAGMA cipher_page_size</c> branch could not have worked anyway: it was
+    /// issued BEFORE <c>PRAGMA key</c>, and SQLCipher's handler is guarded by
+    /// <c>if(ctx)</c> - before the key is set there is no codec context, so the
+    /// statement silently returns success (SQLCipher 4.5.2 crypto.c:263-275). Per
+    /// SQLCipher's documentation the pragma must be issued AFTER <c>PRAGMA key</c>
+    /// and before the first database operation. A future legacy candidate should set
+    /// it there, not before; it is not a broken pragma, only a wrongly ordered one.
+    /// </remarks>
     private readonly record struct KeyCandidate(
         string Name,
         HashAlgorithmName Kdf,
-        int Iterations,
-        int PageSize);
+        int Iterations);
 
     /// <summary>
     /// Ordered list of the SQLCipher parameter sets WeChat has shipped, tried until
-    /// one opens the database. WeChat's own research is internally inconsistent
-    /// about which set belongs to which version, so this is a candidate list rather
-    /// than a single guess, and Connect() reports the one that won.
+    /// one opens the database. Connect() reports the one that won.
     /// </summary>
     /// <remarks>
-    /// Sources:
+    /// <para>
+    /// Sources for the single entry below:
     /// <list type="bullet">
-    /// <item>research/scripts/decrypt_direct.py:32 and research/scripts/decrypt.go:21,106
-    /// - PBKDF2-HMAC-SHA512 x 256000, run against real V4 data.</item>
-    /// <item>research/reports/更新日志-第二次迭代.md:16 and
+    /// <item>research/scripts/decrypt_direct.py:32 and research/scripts/decrypt.go:16,21,106
+    /// - PBKDF2-HMAC-SHA512 x 256000 with a 4096-byte page, run against real V4 data.</item>
+    /// <item>research/experiments/m112/decrypt_test.py:4 - "page=4096", and
+    /// research/reports/更新日志-第二次迭代.md:16 /
     /// research/experiments/m112/WECHAT_EXPORT_RESEARCH_HANDOVER.md:376 -
     /// "SQLCipher 参数确认: PBKDF2-HMAC-SHA512 × 256000 次迭代".</item>
-    /// <item>research/experiments/m112/decrypt_test.py:4,17 - the older
-    /// PBKDF2-HMAC-SHA1 x 64000 path.</item>
     /// </list>
+    /// </para>
+    /// <para>
+    /// A WeChat 3.x / SQLCipher 3 candidate (PBKDF2-HMAC-SHA1 x 64000, page 1024) was
+    /// REMOVED rather than corrected, and it is recorded here as a removed
+    /// capability, not a working one. A real SQLCipher 3 database authenticates
+    /// pages with HMAC-SHA1 over a 36-byte reserve, and it derives that HMAC key with
+    /// PBKDF2-SHA1 (SQLCipher 3.4.2 crypto_impl.c:1235 uses
+    /// <c>ctx-&gt;kdf_algorithm</c> for the HMAC key derivation too). The removed
+    /// candidate set neither <c>cipher_hmac_algorithm</c> nor
+    /// <c>cipher_kdf_algorithm</c>, so a genuine 3.x database could never have
+    /// authenticated even with the correct key material. Removing the candidate means
+    /// such a database is now reported as <see cref="ConnectOutcome.KeyRejected"/>
+    /// with an explicit message, instead of being retried against a candidate that
+    /// cannot succeed. Re-adding a real legacy path would need both pragmas, issued
+    /// after <c>PRAGMA key</c> (see the page-size note above), plus 1024- and
+    /// 4096-page variants - none of which has been verified against a real 3.x
+    /// database or may be claimed as working.
+    /// </para>
     /// </remarks>
     private static readonly KeyCandidate[] RawKeyCandidates =
     {
         new(
             "WeChat 4.x (PBKDF2-HMAC-SHA512, 256000 iterations, page size 4096)",
             HashAlgorithmName.SHA512,
-            256000,
-            SqlCipherDefaultPageSize),
-        new(
-            "WeChat 3.x (PBKDF2-HMAC-SHA1, 64000 iterations, page size 1024)",
-            HashAlgorithmName.SHA1,
-            64000,
-            1024),
+            256000),
     };
 
     private SqliteConnection? _connection;
@@ -260,7 +286,9 @@ public class DatabaseService : IDisposable
             return hasKey
                 ? new ConnectResult(
                     ConnectOutcome.KeyRejected,
-                    "The database could not be decrypted with the supplied key. Check the key, or clear it if the file is not encrypted.")
+                    "The database could not be decrypted with the supplied key. Check the key, or clear it if the file is not encrypted. "
+                  + "Note: this build knows only the WeChat 4.x parameter set (PBKDF2-HMAC-SHA512, 256000 iterations, page size 4096), "
+                  + "so a database written by an older WeChat (SQLCipher 3.x) cannot be opened.")
                 : new ConnectResult(
                     ConnectOutcome.NotADatabase,
                     "The file could not be read as a database. It looks encrypted - supply the decryption key.");
@@ -553,7 +581,15 @@ public class DatabaseService : IDisposable
     /// <summary>
     /// Gets messages from a specific conversation.
     /// </summary>
-    /// <param name="contactId">The contact/user ID.</param>
+    /// <param name="contactIdentifier">
+    /// The contact's identifier exactly as the database stores it: a wxid such as
+    /// <c>wxid_abc123</c> in a real WeChat database, or a numeric id in a synthetic
+    /// one. It is deliberately a <see cref="string"/> rather than a <c>long</c>: the
+    /// numeric view (<see cref="Contact.UserId"/>) is <c>0</c> for every real
+    /// contact, so passing it filtered on <c>'0'</c> and a real conversation came
+    /// back empty. The caller cannot express "the numeric id" here any more - only
+    /// the identifier the database actually holds (see <see cref="Contact.Identifier"/>).
+    /// </param>
     /// <param name="limit">Maximum number of messages to retrieve (default 1000).</param>
     /// <param name="conversationDisplayName">
     /// Display name of the conversation's contact. Used to fill in
@@ -568,7 +604,7 @@ public class DatabaseService : IDisposable
     /// </param>
     /// <returns>List of messages</returns>
     public List<Message> GetMessages(
-        long contactId,
+        string contactIdentifier,
         int limit = 1000,
         string? conversationDisplayName = null,
         IReadOnlyDictionary<string, string>? senderNames = null)
@@ -582,6 +618,25 @@ public class DatabaseService : IDisposable
             LastError = "Not connected to a database.";
             return messages;
         }
+
+        // An empty identifier would filter on '' and quietly return nothing, which
+        // is the same silent-empty-result failure the old numeric parameter caused.
+        // Refuse it loudly instead.
+        var identifier = contactIdentifier?.Trim();
+        if (string.IsNullOrEmpty(identifier))
+        {
+            Log.Warning("GetMessages called without a contact identifier");
+            LastError = "No contact identifier was supplied, so no conversation could be selected.";
+            return messages;
+        }
+
+        // SenderId is the legacy numeric view of the conversation partner. It is
+        // only meaningful when the identifier really is numeric (the synthetic
+        // schema); a wxid has no numeric form, so it stays 0 while
+        // Message.SenderIdentifier carries the value the database actually holds.
+        var senderId = long.TryParse(identifier, NumberStyles.Integer, CultureInfo.InvariantCulture, out var numericId)
+            ? numericId
+            : 0L;
 
         try
         {
@@ -603,7 +658,7 @@ public class DatabaseService : IDisposable
                 LIMIT @Limit";
 
             using var cmd = new SqliteCommand(query, _connection);
-            cmd.Parameters.AddWithValue("@ContactId", contactId.ToString());
+            cmd.Parameters.AddWithValue("@ContactId", identifier);
             cmd.Parameters.AddWithValue("@Limit", limit);
 
             using var reader = cmd.ExecuteReader();
@@ -619,7 +674,7 @@ public class DatabaseService : IDisposable
                     IsFromSelf = isFromSelf,
                     Content = reader.IsDBNull(3) ? null : reader.GetString(3),
                     Type = (MessageType)reader.GetInt32(4),
-                    SenderId = isFromSelf ? 0 : contactId,
+                    SenderId = isFromSelf ? 0 : senderId,
                     // The sender exactly as stored (a wxid in a real database). Kept so
                     // the exports can attribute a message to a stable identifier when no
                     // display name could be resolved, instead of printing "Unknown".
@@ -650,11 +705,11 @@ public class DatabaseService : IDisposable
             // Reverse to get chronological order
             messages.Reverse();
 
-            Log.Information("Retrieved {Count} messages for contact {ContactId}", messages.Count, contactId);
+            Log.Information("Retrieved {Count} messages for contact {ContactIdentifier}", messages.Count, identifier);
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Failed to retrieve messages for contact {ContactId}", contactId);
+            Log.Error(ex, "Failed to retrieve messages for contact {ContactIdentifier}", identifier);
             LastError = $"Failed to read messages: {ex.Message}";
         }
 
@@ -718,17 +773,34 @@ public class DatabaseService : IDisposable
         }
 
         var connection = new SqliteConnection(builder.ToString());
-        connection.Open();
-
-        _appliedKeyDescription = _passphrase is null ? "none (unencrypted)" : "passphrase";
-
-        using (var probe = connection.CreateCommand())
+        try
         {
-            probe.CommandText = "SELECT count(*) FROM sqlite_master;";
-            probe.ExecuteScalar();
-        }
+            connection.Open();
 
-        return connection;
+            _appliedKeyDescription = _passphrase is null ? "none (unencrypted)" : "passphrase";
+
+            using (var probe = connection.CreateCommand())
+            {
+                probe.CommandText = "SELECT count(*) FROM sqlite_master;";
+                probe.ExecuteScalar();
+            }
+
+            return connection;
+        }
+        catch
+        {
+            // A wrong passphrase is the NORMAL outcome of this path, not an edge
+            // case: Open() applies the key and the first read rejects it, so the
+            // catch below this one runs on every failed attempt - and Connect() is
+            // retried by the UI whenever the user edits the key. Without this
+            // disposal each failed attempt leaked the connection: a native sqlite3
+            // handle and the applied key material, since this connection is
+            // deliberately unpooled (see the Pooling note in
+            // OpenRawKeyConnection). OpenRawKeyConnection already disposes its
+            // failed candidates; this keeps the two keyed-open paths in step.
+            connection.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -775,13 +847,9 @@ public class DatabaseService : IDisposable
             {
                 connection.Open();
 
-                if (candidate.PageSize != SqlCipherDefaultPageSize)
-                {
-                    // Must precede PRAGMA key.
-                    using var pageSizeCommand = connection.CreateCommand();
-                    pageSizeCommand.CommandText = $"PRAGMA cipher_page_size = {candidate.PageSize};";
-                    pageSizeCommand.ExecuteNonQuery();
-                }
+                // No PRAGMA cipher_page_size here: the candidate's 4096 is SQLCipher
+                // 4's default (nothing to set), and the pragma is a no-op in this
+                // build anyway - see the remarks on RawKeyCandidates.
 
                 // The derived bytes are passed as a RAW key, so SQLCipher must not
                 // derive again - that is the point: the KDF has already been run in

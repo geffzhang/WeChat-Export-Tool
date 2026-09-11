@@ -375,8 +375,23 @@ public partial class MainWindowViewModel : ObservableObject
                 .GroupBy(c => c.Identifier!)
                 .ToDictionary(g => g.Key, g => g.First().DisplayName!);
 
+            // The conversation is selected by the identifier the database stores, NOT
+            // by Contact.UserId. UserId is a long and is 0 for every real wxid_...
+            // contact, so passing it made the query filter on Sender = '0' and a real
+            // conversation came back empty - which is exactly the rule stated three
+            // lines above. GetMessages now takes the string identifier, so that value
+            // can no longer be supplied by accident.
+            var contactIdentifier = contact.Identifier;
+            if (string.IsNullOrWhiteSpace(contactIdentifier))
+            {
+                Messages.Clear();
+                MessageCount = 0;
+                StatusMessage = $"Cannot load messages for {contact.DisplayName}: this contact has no database identifier.";
+                return;
+            }
+
             var messages = await Task.Run(() =>
-                _databaseService.GetMessages(contact.UserId, 1000, contact.DisplayName, senderNames));
+                _databaseService.GetMessages(contactIdentifier, 1000, contact.DisplayName, senderNames));
             var error = _databaseService.LastError;
 
             Messages.Clear();
