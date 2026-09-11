@@ -158,6 +158,24 @@ public class DatabaseService : IDisposable
     /// </summary>
     private const string UnsupportedContentMarker = "[unsupported compressed content]";
 
+    /// <summary>
+    /// Ceiling on a single zstd-decompressed message content, in bytes.
+    /// </summary>
+    /// <remarks>
+    /// A zstd frame's HEADER declares its decompressed size, and without a bound the
+    /// library allocates that much before decoding anything (ZstdSharp's one-argument
+    /// <c>Unwrap</c> defaults to <see cref="int.MaxValue"/>). MEASURED: an 8,211-byte
+    /// frame expands to 256 MB, and corrupting 4 bytes of a frame header makes the
+    /// library allocate 1,000,000,024 bytes before the decode fails - on content that
+    /// comes out of the user's own database, i.e. that this tool does not control.
+    /// Message content in a real install peaks at 189,764 characters (compressed
+    /// 40,998 bytes) across 283,458 compressed rows, so this ceiling is ~88x the
+    /// largest real content and cannot be hit by anything a chat actually contains.
+    /// Exceeding it is handled by the existing honest path: the message is replaced by
+    /// <see cref="UnsupportedContentMarker"/>, never by a partial or raw-byte string.
+    /// </remarks>
+    private const int MaxDecompressedContentBytes = 16 * 1024 * 1024;
+
     /// <summary>How many 1:1 chats to scan when deriving the owner empirically.</summary>
     private const int OwnerScanChatLimit = 40;
 
@@ -390,6 +408,14 @@ public class DatabaseService : IDisposable
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Message shards that were discovered beside the primary database but could not
+    /// be opened, so their messages are absent from every read. Empty when every
+    /// shard opened. This is connection state, not query state: it is set by Connect
+    /// and lives until the connection is dropped.
+    /// </summary>
+    private List<string> _unopenedShards = new();
+
+    /// <summary>
     /// SessionTable rows with their rowids. <c>null</c> means "not read yet"; an
     /// empty list means the table is absent (the degraded case - see GetContacts).
     /// </summary>
@@ -425,6 +451,13 @@ public class DatabaseService : IDisposable
     /// genuinely nothing to return" from "the read blew up and we swallowed it".
     /// Cleared at the start of every query.
     /// </summary>
+    /// <remarks>
+    /// Also set when a read SUCCEEDED but is knowingly incomplete - a conversation
+    /// list degraded to table names, or a message read missing a shard that never
+    /// opened (see <see cref="UnopenedShards"/>) - so a partial result is never
+    /// presented as a complete one. A real failure always wins over these
+    /// degradations, which are attached with <c>??=</c>.
+    /// </remarks>
     public string? LastError { get; private set; }
 
     /// <summary>
@@ -433,6 +466,46 @@ public class DatabaseService : IDisposable
     /// instead of reporting a silent, indistinguishable-from-complete result.
     /// </summary>
     public bool LastResultTruncated { get; private set; }
+
+    /// <summary>
+    /// The message shards that were found beside the primary database but would not
+    /// open, so their messages are missing from every read. Empty for a complete
+    /// connection.
+    /// </summary>
+    /// <remarks>
+    /// R10: an unopenable shard is an ORDINARY condition, not an exotic one - WeChat
+    /// keeps its databases open while this tool reads them, so a locked, truncated or
+    /// mid-rotation <c>message_N.db</c> is expected. Skipping it silently made
+    /// <see cref="Connect"/> report <see cref="ConnectOutcome.Success"/> and
+    /// <see cref="GetMessages"/> return a plausible but short list (measured: 2,753
+    /// of a chat's 3,966 messages, with <see cref="LastError"/> null), which is the
+    /// silent empty result R10 forbids. The shards stay non-fatal - the messages that
+    /// did open are still usable - but the shortfall is named here, in the connect
+    /// result and in <see cref="LastError"/>.
+    /// </remarks>
+    public IReadOnlyList<string> UnopenedShards => _unopenedShards;
+
+    /// <summary>
+    /// A user-facing line naming the shards whose messages are missing, or null when
+    /// every shard opened.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately NOT folded into <see cref="LastResultTruncated"/>: that flag means
+    /// "the newest <c>limit</c> messages were returned and older ones exist", which is
+    /// a property of one query and is recoverable by asking for more. A shard that
+    /// never opened is a property of the CONNECTION, is not recoverable by re-querying,
+    /// and makes the count smaller for the opposite reason (the newest messages can be
+    /// the ones in the missing shard). Overloading one flag with both meanings would
+    /// make the UI line wrong in one of the two cases.
+    /// </remarks>
+    private string? UnopenedShardWarning()
+    {
+        if (_unopenedShards.Count == 0)
+            return null;
+
+        return $"{_unopenedShards.Count} message shard(s) could not be opened, so messages stored in them are missing "
+             + $"from this result: {string.Join(", ", _unopenedShards.Select(Path.GetFileName))}.";
+    }
 
     /// <summary>
     /// The signed-in account's own identity, used to decide whether a message was
@@ -570,8 +643,15 @@ public class DatabaseService : IDisposable
                     MsgTablePrefix,
                     _tableNames.Count,
                     string.Join(", ", _tableNames));
-                DisconnectInternal();
+                // Dispose first, THEN clear: DisconnectInternal() replaces _shards
+                // with an empty list WITHOUT disposing anything, so the reverse order
+                // (the order this used to be in) made DisposeConnections()'s loop
+                // iterate an empty list and leak every sibling shard connection -
+                // handle, key material and all - for the life of the process, on a
+                // path the UI re-enters on every retry. The two sibling catch paths
+                // below already had this order.
                 DisposeConnections();
+                DisconnectInternal();
 
                 return new ConnectResult(
                     ConnectOutcome.SchemaMismatch,
@@ -731,7 +811,11 @@ public class DatabaseService : IDisposable
             catch (Exception ex)
             {
                 // R10: a shard that will not open is named and skipped, never
-                // swallowed into a result that looks complete.
+                // swallowed into a result that looks complete. Naming it in a log
+                // line was not enough - the log is not the result. Record it so the
+                // connect result, LastError and UnopenedShards all say the same
+                // thing, and a short message list cannot read as a complete one.
+                _unopenedShards.Add(shardPath);
                 Log.Warning(ex, "Could not open message shard {ShardPath}; its messages will be missing from exports", shardPath);
             }
         }
@@ -772,6 +856,11 @@ public class DatabaseService : IDisposable
 
         if (_ownerIdentity is not null)
             described += $" Owner: {_ownerIdentity}.";
+
+        // R10: "Success" may not imply "complete". A shard that would not open is
+        // named in the very same line that reports how many shards were found.
+        if (UnopenedShardWarning() is { } unopened)
+            described += $" WARNING: {unopened}";
 
         return described;
     }
@@ -1145,6 +1234,10 @@ public class DatabaseService : IDisposable
             LastError = $"Failed to read the conversation list: {ex.Message}";
         }
 
+        // A successful-but-short list is still not a complete one: a conversation
+        // whose messages live only in a shard that never opened is missing here.
+        LastError ??= UnopenedShardWarning();
+
         return contacts;
     }
 
@@ -1497,6 +1590,12 @@ public class DatabaseService : IDisposable
             LastError = $"Failed to read messages: {ex.Message}";
         }
 
+        // MEASURED failure this guards: with message_1.db unopenable, this chat came
+        // back with 2,753 of its 3,966 messages and LastError == null - a short list
+        // indistinguishable from a complete one. A shard that never opened is the one
+        // case a re-query cannot fix, so it must be said here.
+        LastError ??= UnopenedShardWarning();
+
         return messages;
     }
 
@@ -1650,7 +1749,10 @@ public class DatabaseService : IDisposable
         try
         {
             using var decompressor = new Decompressor();
-            var text = Encoding.UTF8.GetString(decompressor.Unwrap(bytes));
+            // Bounded: the frame's own header must not be able to make this allocate
+            // an arbitrary amount of memory (see MaxDecompressedContentBytes).
+            var text = Encoding.UTF8.GetString(
+                decompressor.Unwrap(bytes, MaxDecompressedContentBytes));
 
             if (text.Length > 0)
                 return text;
@@ -2384,12 +2486,17 @@ public class DatabaseService : IDisposable
     /// </summary>
     private void DisposeConnections()
     {
-        _connection?.Dispose();
+        // Snapshot the primary BEFORE clearing the field: the shard list holds the
+        // same connection as its first entry, and the guard below used to compare
+        // against an already-nulled _connection, so it could never fire and the
+        // primary was disposed twice (harmless, but the guard said otherwise).
+        var primary = _connection;
         _connection = null;
+        primary?.Dispose();
 
         foreach (var shard in _shards)
         {
-            if (!ReferenceEquals(shard.Connection, _connection))
+            if (!ReferenceEquals(shard.Connection, primary))
                 shard.Connection.Dispose();
         }
 
@@ -2408,6 +2515,7 @@ public class DatabaseService : IDisposable
         // later Connect() would read the old schema's tables.
         _tableNames = new List<string>();
         _shards = new List<Shard>();
+        _unopenedShards = new List<string>();
         _messageTables = new List<string>();
         _messageTableShards = new Dictionary<string, List<Shard>>(StringComparer.OrdinalIgnoreCase);
         _sessionRows = null;

@@ -275,6 +275,19 @@ public class ExportService
     /// </summary>
     private const int ExcelMaxCellLength = 32767;
 
+    /// <summary>
+    /// Truncates a value to Excel's per-cell limit for the marker to be appended.
+    /// </summary>
+    /// <remarks>
+    /// The cut is taken on a CODE POINT boundary: .NET strings are UTF-16, so an
+    /// emoji or any non-BMP character at the cut point would otherwise be split into
+    /// a high surrogate with no low surrogate (or vice versa) - a lone surrogate,
+    /// which is not a character. ClosedXML/XmlWriter tolerate it by writing a
+    /// replacement character, so it corrupts the cell rather than failing the export.
+    /// Stepping back one unit when the last kept unit is a HIGH surrogate keeps the
+    /// whole pair on one side of the cut; the low surrogate can never end up alone
+    /// this way, because it can only be reached through its high surrogate.
+    /// </remarks>
     private static string ExcelCell(string? value)
     {
         var text = value ?? string.Empty;
@@ -282,7 +295,11 @@ public class ExportService
             return text;
 
         const string marker = "…[truncated]";
-        return text[..(ExcelMaxCellLength - marker.Length)] + marker;
+        var take = ExcelMaxCellLength - marker.Length;
+        if (char.IsHighSurrogate(text[take - 1]))
+            take--;
+
+        return text[..take] + marker;
     }
 
     public void ExportToPdf(Conversation conversation, string outputPath)
