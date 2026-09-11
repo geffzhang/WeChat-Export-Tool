@@ -48,6 +48,31 @@
     <Delete Files="@(PdbsToDelete)" />
   </Target>
 
+  <!-- wx_key.dll is the native hook that captures WeChat's SQLCipher key. It
+       cannot be reimplemented in managed code, so it ships as a plain native
+       library and is loaded by Core/Decryption/WxKeyInterop.cs via DllImport.
+       It is copied to the output ROOT, not a subfolder, because DllImport
+       resolves against the application directory.
+       x64 only, matching <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>.
+
+       ExcludeFromSingleFile is load-bearing, not cosmetic. Without it the
+       publish bundles this DLL into the single-file exe, and
+       IncludeNativeLibrariesForSelfExtract then extracts it at RUNTIME to
+       %TEMP%\.net\WeChatExport\<dir>\ - a directory the logged-in user can
+       write. The process that loads it is the elevated key-capture child, so
+       that would have an administrator process loading a native library from a
+       user-writable path. Keeping it a real file beside the exe means it is
+       loaded from the application directory instead. Verified: after this
+       change the publish directory contains wx_key.dll as a loose file and the
+       published exe no longer resolves it out of %TEMP%. -->
+  <ItemGroup>
+    <None Include="..\dll\wx_key.dll"
+          Link="wx_key.dll"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest"
+          ExcludeFromSingleFile="true" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="Avalonia" Version="12.1.2" />
     <PackageReference Include="Avalonia.Desktop" Version="12.1.2" />

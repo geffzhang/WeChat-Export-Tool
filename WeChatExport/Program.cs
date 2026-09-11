@@ -3,13 +3,14 @@ using System.IO;
 using Avalonia;
 using Serilog;
 using Serilog.Events;
+using WeChatExport.Services;
 
 namespace WeChatExport;
 
 class Program
 {
     [STAThread]
-    public static void Main(string[] args)
+    public static int Main(string[] args)
     {
         var logDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -25,6 +26,10 @@ class Program
                 Path.Combine(logDirectory, "app-.log"),
                 rollingInterval: RollingInterval.Day,
                 retainedFileCountLimit: 7,
+                // The elevated key-capture child is this same executable and logs
+                // to this same file. Without shared:true the second process's
+                // writes would collide with the first's.
+                shared: true,
                 outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {SourceContext} {Message:lj}{NewLine}{Exception}")
             .CreateLogger();
 
@@ -35,8 +40,17 @@ class Program
 
         try
         {
+            // Key capture has to run elevated, so the GUI relaunches this same
+            // executable through the shell's runas verb. That second instance is
+            // this branch: no window, no Avalonia, just the capture, reporting
+            // progress through files for the original instance to relay.
+            // The finally below flushes the log for this path too.
+            if (args.Length >= 2 && args[0] == KeyCaptureProtocol.CaptureSwitch)
+                return ElevatedKeyCapture.Run(args[1]);
+
             Log.Information("Application starting");
             BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+            return 0;
         }
         catch (Exception ex)
         {

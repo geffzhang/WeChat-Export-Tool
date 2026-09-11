@@ -206,26 +206,36 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Manual key-capture attempt. A single process enumeration answers both "is it
-    /// running?" and "did we get a key?", so pressing the button no longer walks the
-    /// process list twice. The process-memory scan itself remains a deliberate stub
-    /// (see KeyCaptureService.AttemptCapture).
+    /// Captures the decryption key from WeChat, reporting progress as it goes.
+    ///
+    /// WeChat hands its database key over exactly once, when the process starts,
+    /// so this cannot read the key out of an already-running WeChat - the user
+    /// has to quit WeChat and start it again while the capture is armed. The
+    /// status text says so, because otherwise the button looks like it should
+    /// just work.
+    ///
+    /// The capture itself needs administrator rights and runs in an elevated
+    /// child process; see <see cref="KeyCaptureService.CaptureKeyAsync"/>.
     /// </summary>
     [RelayCommand]
-    private void CaptureKey()
+    private async Task CaptureKeyAsync()
     {
-        var attempt = _keyCaptureService.AttemptCapture();
+        // Progress is created on the UI thread, so its callback is marshalled
+        // back to it - StatusMessage is bound to the view.
+        var progress = new Progress<string>(text => StatusMessage = text);
 
-        if (!string.IsNullOrWhiteSpace(attempt.Key))
+        StatusMessage = "Quit WeChat from the system tray first, then confirm the prompt...";
+
+        var result = await _keyCaptureService.CaptureKeyAsync(progress);
+
+        if (result.IsSuccess && !string.IsNullOrWhiteSpace(result.Key))
         {
-            DecryptionKey = attempt.Key;
-            StatusMessage = "Decryption key captured from the running WeChat process";
+            DecryptionKey = result.Key;
+            StatusMessage = "Decryption key captured and saved.";
             return;
         }
 
-        StatusMessage = attempt.WeChatRunning
-            ? "WeChat is running, but automatic key capture is not implemented yet - paste the key manually."
-            : "WeChat does not appear to be running. Start and sign in to WeChat, or paste the key manually.";
+        StatusMessage = result.Message;
     }
 
     [RelayCommand(CanExecute = nameof(CanConnect))]
