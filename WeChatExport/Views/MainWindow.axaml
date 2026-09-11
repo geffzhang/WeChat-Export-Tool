@@ -1,0 +1,249 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:WeChatExport.ViewModels"
+        xmlns:models="using:WeChatExport.Core.Models"
+        x:Class="WeChatExport.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="{Binding Title}"
+        Width="1200"
+        Height="800"
+        MinWidth="900"
+        MinHeight="600">
+
+    <Design.DataContext>
+        <vm:MainWindowViewModel/>
+    </Design.DataContext>
+
+    <Grid RowDefinitions="Auto,*,Auto">
+        <!-- Toolbar -->
+        <Border Grid.Row="0"
+                Background="#F5F5F5"
+                Padding="10"
+                BorderBrush="#E0E0E0"
+                BorderThickness="0,0,0,1">
+            <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto">
+                <!-- WeChat Path -->
+                <TextBlock Grid.Column="0"
+                           Text="WeChat Path:"
+                           VerticalAlignment="Center"
+                           Margin="0,0,10,0"/>
+                <TextBox Grid.Column="1"
+                         Text="{Binding WeChatPath}"
+                         PlaceholderText="Select WeChat installation folder..."
+                         VerticalAlignment="Center"
+                         Margin="0,0,10,0"/>
+
+                <!-- Decryption Key -->
+                <TextBlock Grid.Column="2"
+                           Text="Key:"
+                           VerticalAlignment="Center"
+                           Margin="0,0,10,0"/>
+                <TextBox Grid.Column="3"
+                         Text="{Binding DecryptionKey}"
+                         PasswordChar="*"
+                         PlaceholderText="Decryption key (optional)"
+                         VerticalAlignment="Center"
+                         Width="150"
+                         Margin="0,0,10,0"/>
+
+                <!-- Action Buttons -->
+                <StackPanel Grid.Column="4"
+                            Orientation="Horizontal"
+                            Spacing="10">
+                    <Button Content="Browse"
+                            Command="{Binding BrowseWeChatPathCommand}"
+                            Padding="15,8"/>
+                    <Button Content="Connect"
+                            Command="{Binding ConnectCommand}"
+                            IsEnabled="{Binding !IsLoading}"
+                            Padding="15,8"/>
+                    <Button Content="Disconnect"
+                            Command="{Binding DisconnectCommand}"
+                            IsEnabled="{Binding IsConnected}"
+                            Padding="15,8"/>
+                    <Button Content="Export"
+                            Command="{Binding ExportCommand}"
+                            IsEnabled="{Binding IsConnected}"
+                            Padding="15,8"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Main Content -->
+        <Grid Grid.Row="1" ColumnDefinitions="300,*">
+            <!-- Contact List Panel -->
+            <Border Grid.Column="0"
+                    BorderBrush="#E0E0E0"
+                    BorderThickness="0,0,1,0">
+                <Grid RowDefinitions="Auto,*">
+                    <!-- Contact List Header -->
+                    <Border Grid.Row="0"
+                            Background="#FAFAFA"
+                            Padding="10"
+                            BorderBrush="#E0E0E0"
+                            BorderThickness="0,0,0,1">
+                        <Grid ColumnDefinitions="*,Auto">
+                            <TextBlock Text="Contacts"
+                                       FontSize="16"
+                                       FontWeight="SemiBold"
+                                       VerticalAlignment="Center"/>
+                            <TextBlock Grid.Column="1"
+                                       Text="{Binding ContactCount, StringFormat='({0})'}"
+                                       Foreground="Gray"
+                                       VerticalAlignment="Center"/>
+                        </Grid>
+                    </Border>
+
+                    <!-- Contact List -->
+                    <ListBox Grid.Row="1"
+                             ItemsSource="{Binding Contacts}"
+                             SelectedItem="{Binding SelectedContact}"
+                             SelectionMode="Single">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="models:Contact">
+                                <Grid Margin="5" RowDefinitions="Auto,Auto,Auto">
+                                    <TextBlock Grid.Row="0"
+                                               Text="{Binding DisplayName}"
+                                               FontWeight="SemiBold"
+                                               TextTrimming="CharacterEllipsis"/>
+                                    <TextBlock Grid.Row="1"
+                                               Text="{Binding NickName}"
+                                               Foreground="Gray"
+                                               FontSize="12"
+                                               TextTrimming="CharacterEllipsis"/>
+                                    <TextBlock Grid.Row="2"
+                                               Text="{Binding LastMessagePreview}"
+                                               Foreground="Gray"
+                                               FontSize="11"
+                                               TextTrimming="CharacterEllipsis"
+                                               IsVisible="{Binding LastMessagePreview, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+                </Grid>
+            </Border>
+
+            <!-- Message View Panel -->
+            <Grid Grid.Column="1" RowDefinitions="Auto,*">
+                <!-- Message View Header -->
+                <Border Grid.Row="0"
+                        Background="#FAFAFA"
+                        Padding="10"
+                        BorderBrush="#E0E0E0"
+                        BorderThickness="0,0,0,1">
+                    <Grid ColumnDefinitions="*,Auto">
+                        <TextBlock Text="{Binding SelectedContact.DisplayName, FallbackValue='Select a conversation'}"
+                                   FontSize="16"
+                                   FontWeight="SemiBold"
+                                   VerticalAlignment="Center"/>
+                        <TextBlock Grid.Column="1"
+                                   Text="{Binding MessageCount, StringFormat='{}{0} messages'}"
+                                   Foreground="Gray"
+                                   VerticalAlignment="Center"/>
+                    </Grid>
+                </Border>
+
+                <!-- Message List -->
+                <ListBox Grid.Row="1"
+                         ItemsSource="{Binding Messages}"
+                         SelectedItem="{Binding SelectedMessage}"
+                         SelectionMode="Single">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate x:DataType="models:Message">
+                            <Border Padding="10"
+                                    Margin="5"
+                                    Background="{Binding IsFromSelf, Converter={StaticResource BoolToBackgroundConverter}, FallbackValue='#FFFFFF'}"
+                                    CornerRadius="5">
+                                <Grid RowDefinitions="Auto,Auto,Auto">
+                                    <!-- Sender and Time -->
+                                    <StackPanel Grid.Row="0"
+                                                Orientation="Horizontal"
+                                                Spacing="10"
+                                                Margin="0,0,0,5">
+                                        <TextBlock Text="{Binding SenderName, FallbackValue=''}"
+                                                   FontWeight="SemiBold"
+                                                   FontSize="12"/>
+                                        <TextBlock Text="{Binding CreateTime, StringFormat='{}{0:yyyy-MM-dd HH:mm:ss}'}"
+                                                   Foreground="Gray"
+                                                   FontSize="11"/>
+                                        <TextBlock Text="(You)"
+                                                   Foreground="#4CAF50"
+                                                   FontSize="11"
+                                                   FontWeight="SemiBold"
+                                                   IsVisible="{Binding IsFromSelf}"/>
+                                    </StackPanel>
+
+                                    <!-- Message Content -->
+                                    <TextBlock Grid.Row="1"
+                                               Text="{Binding Content}"
+                                               TextWrapping="Wrap"
+                                               FontSize="14"/>
+
+                                    <!-- Message Type Indicator -->
+                                    <TextBlock Grid.Row="2"
+                                               Text="{Binding Type}"
+                                               Foreground="Gray"
+                                               FontSize="10"
+                                               Margin="0,5,0,0"
+                                               IsVisible="False"/>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <!-- Empty State -->
+                <TextBlock Grid.Row="1"
+                           Text="Select a contact to view messages"
+                           HorizontalAlignment="Center"
+                           VerticalAlignment="Center"
+                           Foreground="Gray"
+                           FontSize="16"
+                           IsVisible="{Binding !IsConnected}"/>
+            </Grid>
+        </Grid>
+
+        <!-- Status Bar -->
+        <Border Grid.Row="2"
+                Background="#F5F5F5"
+                Padding="10,5"
+                BorderBrush="#E0E0E0"
+                BorderThickness="0,1,0,0">
+            <Grid ColumnDefinitions="*,Auto,Auto,Auto">
+                <!-- Status Message -->
+                <TextBlock Grid.Column="0"
+                           Text="{Binding StatusMessage}"
+                           VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis"/>
+
+                <!-- Connection Status -->
+                <StackPanel Grid.Column="1"
+                            Orientation="Horizontal"
+                            Margin="20,0">
+                    <Ellipse Width="10"
+                             Height="10"
+                             Fill="{Binding IsConnected, Converter={StaticResource BoolToColorConverter}, FallbackValue=Gray}"
+                             VerticalAlignment="Center"
+                             Margin="0,0,5,0"/>
+                    <TextBlock Text="{Binding IsConnected, Converter={StaticResource BoolToStatusConverter}, FallbackValue='Not Connected'}"
+                               VerticalAlignment="Center"
+                               FontSize="12"/>
+                </StackPanel>
+
+                <!-- Contact Count -->
+                <TextBlock Grid.Column="2"
+                           Text="{Binding ContactCount, StringFormat='Contacts: {0}'}"
+                           VerticalAlignment="Center"
+                           Margin="20,0"
+                           FontSize="12"/>
+
+                <!-- Message Count -->
+                <TextBlock Grid.Column="3"
+                           Text="{Binding MessageCount, StringFormat='Messages: {0}'}"
+                           VerticalAlignment="Center"
+                           FontSize="12"/>
+            </Grid>
+        </Border>
+    </Grid>
+</Window>

@@ -15,7 +15,9 @@ Thumbs.db
 
 # Build output
 dist/
-WeChatExport/
+WeChatExport/bin/
+WeChatExport/obj/
+publish/
 
 # 发布包
 APP/
@@ -26,3 +28,4 @@ resources/bin/
 迭代/
 *.zip
 research/scripts/decrypt.exe
+WeChatExport/.superpowers/
