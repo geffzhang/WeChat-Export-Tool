@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Unicode;
 using ClosedXML.Excel;
 using QuestPDF.Fluent;
 using QuestPDF.Helpers;
@@ -44,7 +46,10 @@ public class ExportService
 
             var json = JsonSerializer.Serialize(exportData, new JsonSerializerOptions
             {
-                WriteIndented = true
+                WriteIndented = true,
+                // Preserve CJK and other non-ASCII text literally instead of \uXXXX
+                // escapes -- this is a Chinese chat export, users read it directly.
+                Encoder = JavaScriptEncoder.Create(UnicodeRanges.All)
             });
 
             File.WriteAllText(outputPath, json);
