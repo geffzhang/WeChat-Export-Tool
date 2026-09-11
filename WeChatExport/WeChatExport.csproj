@@ -63,6 +63,12 @@
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlcipher" Version="2.1.11" />
     <PackageReference Include="ClosedXML" Version="0.104.1" />
     <PackageReference Include="QuestPDF" Version="2026.2.0" />
+    <!-- WeChat 4.x stores some message content zstd-compressed (the row's
+         WCDB_CT_message_content is 4). ZstdSharp.Port is a pure managed port with no
+         native dependency, so it neither complicates the self-contained single-file
+         publish nor adds a second native SQLite/Skia payload. See
+         DatabaseService.ReadContent. -->
+    <PackageReference Include="ZstdSharp.Port" Version="0.8.1" />
     <PackageReference Include="Serilog" Version="4.1.0" />
     <PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
   </ItemGroup>

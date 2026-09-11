@@ -390,8 +390,11 @@ public partial class MainWindowViewModel : ObservableObject
                 return;
             }
 
-            var messages = await Task.Run(() =>
-                _databaseService.GetMessages(contactIdentifier, 1000, contact.DisplayName, senderNames));
+            var (messages, truncated) = await Task.Run(() =>
+            {
+                var loaded = _databaseService.GetMessages(contactIdentifier, 1000, contact.DisplayName, senderNames);
+                return (loaded, _databaseService.LastResultTruncated);
+            });
             var error = _databaseService.LastError;
 
             Messages.Clear();
@@ -406,6 +409,12 @@ public partial class MainWindowViewModel : ObservableObject
             {
                 Log.Error("Message load reported an error: {Error}", error);
                 StatusMessage = error;
+            }
+            else if (truncated)
+            {
+                // A silent cap looks identical to a complete history. Say so.
+                Log.Information("Message load was truncated to the {Limit} most recent messages", MessageCount);
+                StatusMessage = $"Loaded the {MessageCount} most recent messages (older messages exist in the database).";
             }
             else
             {

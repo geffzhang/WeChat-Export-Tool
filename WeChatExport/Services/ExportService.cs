@@ -225,17 +225,34 @@ public class ExportService
             headerRange.Style.Fill.BackgroundColor = XLColor.LightGray;
 
             var row = 2;
+            var truncated = 0;
             foreach (var msg in conversation.Messages.OrderBy(m => m.CreateTime))
             {
                 worksheet.Cell(row, 1).Value = msg.CreateTime.ToString("yyyy-MM-dd HH:mm:ss");
                 worksheet.Cell(row, 2).Value = GetSenderLabel(msg);
-                worksheet.Cell(row, 3).Value = msg.Content ?? "";
+
+                var content = ExcelCell(msg.Content);
+                if (content.Length != (msg.Content?.Length ?? 0))
+                    truncated++;
+
+                worksheet.Cell(row, 3).Value = content;
                 worksheet.Cell(row, 4).Value = msg.Type.ToString();
                 worksheet.Cell(row, 5).Value = msg.IsFromSelf ? "Yes" : "No";
                 row++;
             }
 
             worksheet.Columns().AdjustToContents();
+
+            if (truncated > 0)
+            {
+                // Named, not silent: the cell cannot hold the whole message and the
+                // file says so in the log rather than looking complete.
+                _logger.Warning(
+                    "Truncated {TruncatedCount} Excel cell(s) to Excel's {Limit}-character limit",
+                    truncated,
+                    ExcelMaxCellLength);
+            }
+
             workbook.SaveAs(outputPath);
             _logger.Information("Exported to Excel: {Path}", outputPath);
         }
@@ -244,6 +261,28 @@ public class ExportService
             _logger.Error(ex, "Failed to export to Excel");
             throw;
         }
+    }
+
+    /// <summary>
+    /// Excel's hard per-cell limit. A single real WeChat message can exceed it - a
+    /// merged-forward/appmsg payload, or a long article - and ClosedXML throws
+    /// <see cref="ArgumentOutOfRangeException"/> rather than truncating, which
+    /// aborted the WHOLE workbook. Measured against the real database: a 200-message
+    /// window of one group chat contained such a row and the xlsx export failed
+    /// outright, while the other five formats succeeded. The content is truncated
+    /// with an explicit marker, and the count is logged, so the cell says it is
+    /// incomplete instead of the export dying.
+    /// </summary>
+    private const int ExcelMaxCellLength = 32767;
+
+    private static string ExcelCell(string? value)
+    {
+        var text = value ?? string.Empty;
+        if (text.Length <= ExcelMaxCellLength)
+            return text;
+
+        const string marker = "…[truncated]";
+        return text[..(ExcelMaxCellLength - marker.Length)] + marker;
     }
 
     public void ExportToPdf(Conversation conversation, string outputPath)
