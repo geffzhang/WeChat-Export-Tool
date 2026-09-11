@@ -22,15 +22,21 @@ public partial class MainWindowViewModel : ObservableObject
 
     // Toolbar properties
     [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ConnectCommand))]
     private string _weChatPath = string.Empty;
 
     [ObservableProperty]
     private string _decryptionKey = string.Empty;
 
     [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(LoadMessagesCommand))]
+    [NotifyCanExecuteChangedFor(nameof(ExportCommand))]
     private bool _isConnected;
 
     [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(ConnectCommand))]
+    [NotifyCanExecuteChangedFor(nameof(LoadMessagesCommand))]
+    [NotifyCanExecuteChangedFor(nameof(ExportCommand))]
     private bool _isLoading;
 
     // Contact list
@@ -61,6 +67,20 @@ public partial class MainWindowViewModel : ObservableObject
     {
         _databaseService = new DatabaseService();
         _weChatPathService = new WeChatPathService();
+
+        // ObservableCollection mutations do not raise PropertyChanged, so the
+        // attribute-based NotifyCanExecuteChangedFor cannot see them. CanExport()
+        // depends on Messages.Count (and, defensively, Contacts.Count), so we must
+        // re-notify the commands whenever either collection changes.
+        Messages.CollectionChanged += (_, _) =>
+        {
+            ExportCommand.NotifyCanExecuteChanged();
+            LoadMessagesCommand.NotifyCanExecuteChanged();
+        };
+        Contacts.CollectionChanged += (_, _) =>
+        {
+            ExportCommand.NotifyCanExecuteChanged();
+        };
 
         // Initialize with default WeChat path
         TrySetDefaultWeChatPath();
@@ -93,6 +113,12 @@ public partial class MainWindowViewModel : ObservableObject
             Messages.Clear();
             MessageCount = 0;
         }
+
+        // Both commands gate on SelectedContact, which is not an
+        // ObservableProperty-driven command dependency for attributes to catch here
+        // (the property itself is, but the *commands* are driven by this handler).
+        LoadMessagesCommand.NotifyCanExecuteChanged();
+        ExportCommand.NotifyCanExecuteChanged();
     }
 
     [RelayCommand]
@@ -277,16 +303,72 @@ public partial class MainWindowViewModel : ObservableObject
     [RelayCommand(CanExecute = nameof(CanExport))]
     private async Task Export()
     {
+        if (SelectedContact == null)
+        {
+            StatusMessage = "Please select a contact first";
+            return;
+        }
+
+        var storageProvider = Views.MainWindow.Current?.StorageProvider;
+        if (storageProvider == null)
+        {
+            StatusMessage = "Export unavailable: no active window";
+            return;
+        }
+
         try
         {
             IsLoading = true;
-            StatusMessage = "Exporting data...";
+            StatusMessage = "Choosing export location...";
 
-            // Export functionality would be implemented here
-            // For now, just show status
-            await Task.Delay(100);
+            var file = await storageProvider.SaveFilePickerAsync(new FilePickerSaveOptions
+            {
+                Title = "Export Chat",
+                SuggestedFileName = $"chat_{SelectedContact.DisplayName}",
+                DefaultExtension = "json",
+                FileTypeChoices = new[]
+                {
+                    new FilePickerFileType("JSON")  { Patterns = new[] { "*.json" } },
+                    new FilePickerFileType("CSV")   { Patterns = new[] { "*.csv" } },
+                    new FilePickerFileType("Text")  { Patterns = new[] { "*.txt" } },
+                    new FilePickerFileType("HTML")  { Patterns = new[] { "*.html" } },
+                    new FilePickerFileType("Excel") { Patterns = new[] { "*.xlsx" } },
+                    new FilePickerFileType("PDF")   { Patterns = new[] { "*.pdf" } },
+                }
+            });
 
-            StatusMessage = "Export completed";
+            if (file == null)
+            {
+                StatusMessage = "Export cancelled";
+                return;
+            }
+
+            var outputPath = file.Path.LocalPath;
+            var exportService = new ExportService();
+            var conversation = new Conversation
+            {
+                Contact = SelectedContact,
+                Messages = Messages.ToList(),
+                TotalMessageCount = Messages.Count
+            };
+
+            var ext = Path.GetExtension(outputPath).ToLowerInvariant();
+            await Task.Run(() =>
+            {
+                switch (ext)
+                {
+                    case ".json": exportService.ExportToJson(conversation, outputPath); break;
+                    case ".csv":  exportService.ExportToCsv(conversation, outputPath);  break;
+                    case ".txt":  exportService.ExportToTxt(conversation, outputPath);  break;
+                    case ".html": exportService.ExportToHtml(conversation, outputPath); break;
+                    case ".xlsx": exportService.ExportToExcel(conversation, outputPath); break;
+                    case ".pdf":  exportService.ExportToPdf(conversation, outputPath);  break;
+                    default:
+                        throw new NotSupportedException($"Unsupported export format: {ext}");
+                }
+            });
+
+            StatusMessage = $"Exported to: {outputPath}";
         }
         catch (Exception ex)
         {
@@ -301,7 +383,7 @@ public partial class MainWindowViewModel : ObservableObject
 
     private bool CanExport()
     {
-        return IsConnected && Contacts.Count > 0 && !IsLoading;
+        return IsConnected && SelectedContact != null && Messages.Count > 0 && !IsLoading;
     }
 
     [RelayCommand]

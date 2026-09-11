@@ -53,9 +53,10 @@
                     <Button Content="Browse"
                             Command="{Binding BrowseWeChatPathCommand}"
                             Padding="15,8"/>
+                    <!-- IsEnabled is driven by the command's CanExecute (Avalonia ANDs
+                         IsEnabledCore with CanExecute); do not override it here. -->
                     <Button Content="Connect"
                             Command="{Binding ConnectCommand}"
-                            IsEnabled="{Binding !IsLoading}"
                             Padding="15,8"/>
                     <Button Content="Disconnect"
                             Command="{Binding DisconnectCommand}"
@@ -63,7 +64,6 @@
                             Padding="15,8"/>
                     <Button Content="Export"
                             Command="{Binding ExportCommand}"
-                            IsEnabled="{Binding IsConnected}"
                             Padding="15,8"/>
                 </StackPanel>
             </Grid>
