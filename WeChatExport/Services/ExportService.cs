@@ -30,12 +30,24 @@ public class ExportService
     /// The sender label shown in every export format. Self-authored messages are
     /// always "You" so all six formats agree, rather than only TXT/HTML/PDF.
     /// </summary>
+    /// <remarks>
+    /// Last resort is the raw sender identifier (a wxid), not "Unknown": a wxid is
+    /// stable and distinguishes one sender from another, whereas "Unknown" on every
+    /// message tells the reader nothing at all. "Unknown" only remains for a message
+    /// that has neither a resolved name nor an identifier.
+    /// </remarks>
     private static string GetSenderLabel(Message message)
     {
         if (message.IsFromSelf)
             return "You";
 
-        return string.IsNullOrWhiteSpace(message.SenderName) ? "Unknown" : message.SenderName;
+        if (!string.IsNullOrWhiteSpace(message.SenderName))
+            return message.SenderName;
+
+        if (!string.IsNullOrWhiteSpace(message.SenderIdentifier))
+            return message.SenderIdentifier;
+
+        return "Unknown";
     }
 
     /// <summary>

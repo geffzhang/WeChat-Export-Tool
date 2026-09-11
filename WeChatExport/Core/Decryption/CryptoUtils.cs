@@ -33,6 +33,12 @@ public static class CryptoUtils
     /// <summary>
     /// Gets the WeChat default salt used in WCDB encryption.
     /// </summary>
+    /// <remarks>
+    /// NOT a SQLCipher salt, and not usable as one: this is the literal string
+    /// "wxsecdbkey". SQLCipher's salt is the database file's own first 16 bytes
+    /// (see DatabaseService.ReadSalt). Do not route this into the live decryption
+    /// path.
+    /// </remarks>
     private static byte[] GetWeChatDefaultSalt()
     {
         // WeChat WCDB default salt - typically derived from device information
@@ -151,21 +157,21 @@ public static class CryptoUtils
 
     /// <summary>
     /// Normalises a user-supplied WeChat decryption key into the 64-character
-    /// lowercase hex form that SQLCipher's raw-key syntax expects.
+    /// lowercase hex form used for WeChat's 32 bytes of key material.
     /// </summary>
     /// <remarks>
-    /// WeChat stores a raw 32-byte key, conventionally presented as 64 hex
-    /// characters. SQLCipher must receive those bytes directly:
-    /// <c>PRAGMA key = "x'&lt;64 hex chars&gt;'"</c>. This is deliberately NOT the
-    /// same thing as a passphrase: SQLCipher runs a PBKDF2 derivation over the
-    /// supplied key material either way, but a passphrase is first hashed as text,
-    /// which produces a completely different key and fails to open the database.
-    /// Hence callers must not route a 64-hex WeChat key through the connection
-    /// string <c>Password</c> keyword, and must not pass derived MD5 bytes here.
+    /// This is <em>key material</em>, not a finished SQLCipher key. WeChat hands
+    /// these 32 bytes to <c>sqlite3_key()</c>, and SQLCipher then runs its own
+    /// PBKDF2 over them, salted with the database file's first 16 bytes. The bytes
+    /// returned here therefore still have to be derived before SQLCipher can use
+    /// them: <c>x'&lt;these 64 hex chars&gt;'</c> is SQLCipher's <em>raw key</em>
+    /// form and BYPASSES the KDF entirely, so passing it directly cannot open a
+    /// database WeChat created. See DatabaseService.Connect for the derivation and
+    /// the per-version candidate parameters.
     /// </remarks>
     /// <param name="key">The user-supplied key (may have surrounding whitespace or a 0x prefix).</param>
-    /// <param name="normalizedHex">The 64-character lowercase hex key when this returns true.</param>
-    /// <returns>True if <paramref name="key"/> is a 64-hex-character raw WeChat key.</returns>
+    /// <param name="normalizedHex">The 64-character lowercase hex key material when this returns true.</param>
+    /// <returns>True if <paramref name="key"/> is 64 hex characters of WeChat key material.</returns>
     public static bool TryNormalizeHexKey(string? key, out string? normalizedHex)
     {
         normalizedHex = null;

@@ -22,6 +22,19 @@
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
+  <!-- QuestPDF's package ships a LatoFont/ folder (19 .ttf files) as None items
+       copied to the output and publish directories, via its own QuestPDF.targets.
+       This app never references Lato (Avalonia uses Inter and QuestPDF's own
+       rendering uses its embedded fonts), so drop those items before the copy
+       targets see them - it otherwise doubles the size of the shipped folder
+       beside the single-file exe. -->
+  <Target Name="RemoveUnusedQuestPdfFonts" BeforeTargets="AssignTargetPaths">
+    <ItemGroup>
+      <None Remove="@(None)"
+            Condition="$([System.String]::Copy('%(None.Link)').StartsWith('LatoFont'))" />
+    </ItemGroup>
+  </Target>
+
   <!-- Native packages (SkiaSharp, HarfBuzz) ship large .pdb symbols that a
        release package does not need. -->
   <Target Name="RemovePdbsFromPublish" AfterTargets="Publish">

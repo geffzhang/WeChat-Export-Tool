@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using Microsoft.Data.Sqlite;
 using Serilog;
 using WeChatExport.Core.Decryption;
@@ -30,8 +32,12 @@ public enum ConnectOutcome
     /// <summary>The file opened but is not a SQLite/SQLCipher database we can read.</summary>
     NotADatabase,
 
-    /// <summary>Opened and decrypted, but the tables this app reads are absent.</summary>
-    MissingExpectedTables,
+    /// <summary>
+    /// Opened and decrypted, but the tables this app reads are absent. The message
+    /// lists the tables that <em>were</em> found so the mismatch is diagnosable
+    /// instead of being a dead end.
+    /// </summary>
+    SchemaMismatch,
 
     /// <summary>Anything else (I/O error, provider error, ...).</summary>
     Failed
@@ -48,16 +54,83 @@ public class DatabaseService : IDisposable
     private const int SqliteNotADatabase = 26; // SQLITE_NOTADB
 
     /// <summary>
+    /// SQLCipher keeps its per-database salt in the first 16 bytes of the file.
+    /// It is per-file, NOT a constant - see ReadSalt().
+    /// </summary>
+    private const int SqlCipherSaltSize = 16;
+
+    /// <summary>SQLCipher 4's default page size; a candidate using it needs no PRAGMA.</summary>
+    private const int SqlCipherDefaultPageSize = 4096;
+
+    /// <summary>How many discovered table names to name in a schema-mismatch message.</summary>
+    private const int DiscoveredTableListLimit = 15;
+
+    /// <summary>
     /// Tables this app actually reads out of a MSG database. A real WeChat MSG*.db
     /// uses different table names, so a mismatch surfaces as
-    /// <see cref="ConnectOutcome.MissingExpectedTables"/> rather than a silent
-    /// "0 contacts" - see the honest-failure handling in Connect().
+    /// <see cref="ConnectOutcome.SchemaMismatch"/> (naming the tables that were
+    /// found) rather than a silent "0 contacts" - see the honest-failure handling
+    /// in Connect().
     /// </summary>
     private static readonly string[] ExpectedMsgTables = { "ChatInfo" };
 
+    /// <summary>
+    /// One SQLCipher parameter set that WeChat has shipped. The key is derived with
+    /// this candidate's KDF and handed to SQLCipher as an already-derived raw key.
+    /// </summary>
+    private readonly record struct KeyCandidate(
+        string Name,
+        HashAlgorithmName Kdf,
+        int Iterations,
+        int PageSize);
+
+    /// <summary>
+    /// Ordered list of the SQLCipher parameter sets WeChat has shipped, tried until
+    /// one opens the database. WeChat's own research is internally inconsistent
+    /// about which set belongs to which version, so this is a candidate list rather
+    /// than a single guess, and Connect() reports the one that won.
+    /// </summary>
+    /// <remarks>
+    /// Sources:
+    /// <list type="bullet">
+    /// <item>research/scripts/decrypt_direct.py:32 and research/scripts/decrypt.go:21,106
+    /// - PBKDF2-HMAC-SHA512 x 256000, run against real V4 data.</item>
+    /// <item>research/reports/更新日志-第二次迭代.md:16 and
+    /// research/experiments/m112/WECHAT_EXPORT_RESEARCH_HANDOVER.md:376 -
+    /// "SQLCipher 参数确认: PBKDF2-HMAC-SHA512 × 256000 次迭代".</item>
+    /// <item>research/experiments/m112/decrypt_test.py:4,17 - the older
+    /// PBKDF2-HMAC-SHA1 x 64000 path.</item>
+    /// </list>
+    /// </remarks>
+    private static readonly KeyCandidate[] RawKeyCandidates =
+    {
+        new(
+            "WeChat 4.x (PBKDF2-HMAC-SHA512, 256000 iterations, page size 4096)",
+            HashAlgorithmName.SHA512,
+            256000,
+            SqlCipherDefaultPageSize),
+        new(
+            "WeChat 3.x (PBKDF2-HMAC-SHA1, 64000 iterations, page size 1024)",
+            HashAlgorithmName.SHA1,
+            64000,
+            1024),
+    };
+
     private SqliteConnection? _connection;
     private string? _databasePath;
+
+    /// <summary>The user's 64-hex WeChat key, normalised to lowercase.</summary>
     private string? _rawHexKey;
+
+    /// <summary>A non-hex key, applied as a SQLCipher passphrase.</summary>
+    private string? _passphrase;
+
+    /// <summary>
+    /// How the current connection's key was actually applied, for logging and for
+    /// the success message (e.g. which key candidate won).
+    /// </summary>
+    private string? _appliedKeyDescription;
+
     private bool _disposed;
 
     public bool IsConnected => _connection?.State == System.Data.ConnectionState.Open;
@@ -76,8 +149,9 @@ public class DatabaseService : IDisposable
     /// </summary>
     /// <param name="dbPath">Path to the database file.</param>
     /// <param name="key">
-    /// Optional decryption key. A 64-hex-character value is treated as WeChat's raw
-    /// 32-byte SQLCipher key; anything else is treated as a passphrase.
+    /// Optional decryption key. A 64-hex-character value is treated as WeChat's
+    /// 32-byte key material, which is then run through the candidate KDFs (see
+    /// <see cref="RawKeyCandidates"/>); anything else is treated as a passphrase.
     /// </param>
     public ConnectResult Connect(string dbPath, string? key = null)
     {
@@ -101,95 +175,80 @@ public class DatabaseService : IDisposable
 
         try
         {
-            // WeChat MSG*.db files are SQLCipher v4 databases whose key is a raw
-            // 32-byte value, normally written as 64 hex characters. The matching
-            // derivation is PBKDF2-HMAC-SHA512(rawKey, dbSalt, 256000) - which is
-            // exactly what SQLCipher does with a raw key, and NOT what it does with
-            // a passphrase. So a 64-hex key must go through SQLCipher's raw-key
-            // syntax, issued as the first statement on the connection:
-            //     PRAGMA key = "x'<64 hex chars>'"
-            // Only non-hex input is treated as a passphrase, via
+            // WeChat MSG*.db files are SQLCipher databases. WeChat hands SQLCipher
+            // the 32-byte key material (normally printed as 64 hex characters) via
+            // sqlite3_key(), and SQLCipher then runs its KDF over that material -
+            // the file's own first 16 bytes are the salt. So the caller's 64-hex key
+            // is NOT a SQLCipher raw key: it must be PBKDF2-derived first, and only
+            // the DERIVED bytes may be passed in SQLCipher's raw-key syntax:
+            //     PRAGMA key = "x'<hex of the derived 32 bytes>'"
+            // Passing the underived 64 hex characters as a raw key (what this method
+            // used to do) skips the KDF entirely and cannot open any real WeChat
+            // database - the KDF result and the raw material are different keys.
+            // Which PBKDF2 parameters WeChat used varies by version, so
+            // OpenRawKeyConnection() tries RawKeyCandidates in order.
+            //
+            // Only non-hex input is a passphrase, via
             // SqliteConnectionStringBuilder.Password (which maps to sqlite3_key with
-            // text semantics). Passing a hex WeChat key as Password silently derives
-            // a different key and fails with SQLITE_NOTADB - verified in the fix
-            // harness, so it is not merely a theoretical concern.
-            var connectionString = new SqliteConnectionStringBuilder
-            {
-                DataSource = dbPath,
-                Mode = SqliteOpenMode.ReadOnly
-            };
-
+            // text semantics).
             _rawHexKey = null;
+            _passphrase = null;
             if (hasKey)
             {
                 if (CryptoUtils.TryNormalizeHexKey(key, out var normalizedHex))
-                {
                     _rawHexKey = normalizedHex;
-                }
                 else
-                {
-                    connectionString.Password = key;
-                }
-
-                // A keyed connection must NOT be pooled. The raw-hex key is applied
-                // by a PRAGMA, so it is not part of the connection string and
-                // therefore not part of Microsoft.Data.Sqlite's pool key. A pooled
-                // connection keeps whichever key it was first opened with, so a
-                // later Connect() with a different (even wrong) key would silently
-                // reuse it and appear to succeed. Verified in the fix harness.
-                connectionString.Pooling = false;
+                    _passphrase = key;
             }
 
-            _connection = new SqliteConnection(connectionString.ToString());
-            _connection.Open();
-
-            if (_rawHexKey is not null)
-            {
-                using var keyCommand = _connection.CreateCommand();
-                keyCommand.CommandText = $"PRAGMA key = \"x'{_rawHexKey}'\";";
-                keyCommand.ExecuteNonQuery();
-            }
+            _connection = OpenKeyedConnection(dbPath);
 
             // Opening proves nothing on its own: SQLite defers reading the header
             // until the first statement, so a wrong key or a non-database file only
             // fails here. Probe cheaply and report honestly.
             //
             // Depending on the mechanism, a bad key surfaces either at Open() (the
-            // connection-string Password keyword is validated eagerly) or at this
-            // first read (the raw-hex PRAGMA form is not), so both are covered by the
-            // SQLITE_NOTADB catch clauses around this whole block.
+            // connection-string Password keyword) or at this first read (the raw-key
+            // PRAGMA form is not), so both are covered by the SQLITE_NOTADB catch
+            // clauses around this whole block.
             using (var probe = _connection.CreateCommand())
             {
                 probe.CommandText = "SELECT count(*) FROM sqlite_master;";
                 probe.ExecuteScalar();
             }
 
-            using (var tableProbe = _connection.CreateCommand())
+            // A schema mismatch must still be reported as a failure - it must never
+            // light a green "Connected" over an empty contact list. But it must also
+            // be diagnosable: with no real WeChat database available while this app
+            // is being built, the table list is the artifact needed to finish the
+            // real schema mapping, so name it instead of stopping at "wrong version".
+            var tables = GetTableNames(_connection);
+            var missingTables = ExpectedMsgTables
+                .Where(expected => !tables.Contains(expected, StringComparer.OrdinalIgnoreCase))
+                .ToList();
+
+            if (missingTables.Count > 0)
             {
-                tableProbe.CommandText =
-                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN (" +
-                    string.Join(", ", ExpectedMsgTables.Select((_, i) => $"@t{i}")) + ");";
+                Log.Warning(
+                    "Opened {DbPath} but it is missing the expected table(s) {MissingTables}. Full table list ({TableCount}): {Tables}",
+                    dbPath,
+                    string.Join(", ", missingTables),
+                    tables.Count,
+                    string.Join(", ", tables));
+                DisposeConnection();
 
-                for (var i = 0; i < ExpectedMsgTables.Length; i++)
-                    tableProbe.Parameters.AddWithValue($"@t{i}", ExpectedMsgTables[i]);
-
-                if (Convert.ToInt32(tableProbe.ExecuteScalar()) == 0)
-                {
-                    Log.Warning(
-                        "Connected to {DbPath} but found none of the expected tables ({Tables})",
-                        dbPath,
-                        string.Join(", ", ExpectedMsgTables));
-                    DisposeConnection();
-
-                    return new ConnectResult(
-                        ConnectOutcome.MissingExpectedTables,
-                        $"The database opened, but it has none of the tables this app reads ({string.Join(", ", ExpectedMsgTables)}). The schema is probably a different WeChat version.");
-                }
+                return new ConnectResult(
+                    ConnectOutcome.SchemaMismatch,
+                    BuildSchemaMismatchMessage(missingTables, tables));
             }
 
             _databasePath = dbPath;
-            Log.Information("Connected to WeChat database: {DbPath} (key applied: {HasKey})", dbPath, hasKey);
-            return new ConnectResult(ConnectOutcome.Success, "Connected successfully");
+            Log.Information(
+                "Connected to WeChat database: {DbPath} (key applied: {HasKey}, {KeySource})",
+                dbPath,
+                hasKey,
+                _appliedKeyDescription);
+            return new ConnectResult(ConnectOutcome.Success, "Connected successfully" + FormatKeySuffix());
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode == SqliteNotADatabase)
         {
@@ -212,6 +271,59 @@ public class DatabaseService : IDisposable
             DisposeConnection();
             return new ConnectResult(ConnectOutcome.Failed, $"Connection failed: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Names the key that actually opened the database, so a user can see (and
+    /// report) which WeChat version's parameters worked rather than guessing.
+    /// </summary>
+    private string FormatKeySuffix()
+    {
+        return string.IsNullOrEmpty(_appliedKeyDescription)
+            ? string.Empty
+            : $" (key: {_appliedKeyDescription})";
+    }
+
+    /// <summary>
+    /// Builds the schema-mismatch message: which expected table was missing, and
+    /// which tables were actually found (capped for readability - the full list is
+    /// logged at Warning by the caller).
+    /// </summary>
+    private static string BuildSchemaMismatchMessage(
+        IReadOnlyList<string> missingTables,
+        IReadOnlyList<string> foundTables)
+    {
+        var shown = foundTables.Count == 0
+            ? "(none - the database contains no tables at all)"
+            : string.Join(", ", foundTables.Take(DiscoveredTableListLimit));
+
+        var truncated = foundTables.Count > DiscoveredTableListLimit
+            ? $", ... ({foundTables.Count} tables in total)"
+            : string.Empty;
+
+        return $"The database opened and decrypted, but it is missing the table(s) this app reads "
+             + $"({string.Join(", ", missingTables)}). Tables actually found: {shown}{truncated}. "
+             + "This build does not know this WeChat schema yet - please report the table list above.";
+    }
+
+    /// <summary>
+    /// Lists the real table names in the database, so a schema mismatch can name
+    /// what is there instead of only what is not.
+    /// </summary>
+    private static List<string> GetTableNames(SqliteConnection connection)
+    {
+        var tables = new List<string>();
+
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;";
+        using var reader = command.ExecuteReader();
+        while (reader.Read())
+        {
+            if (!reader.IsDBNull(0))
+                tables.Add(reader.GetString(0));
+        }
+
+        return tables;
     }
 
     /// <summary>
@@ -301,10 +413,15 @@ public class DatabaseService : IDisposable
         try
         {
             // MicroMsg.db is itself a SQLCipher database, so it needs the same key.
-            using var connection = CreateConnection(dbPath);
+            // OpenKeyedConnection() is the single keyed-open path shared with the main
+            // connection, so this sibling database can never be read unkeyed.
+            using var connection = OpenKeyedConnection(dbPath);
 
             // Try to get contacts from MicroMsg.db
-            // Contact table structure varies by WeChat version
+            // UNVERIFIED AGAINST A REAL DATABASE: the table names and especially the
+            // DisplayName/Avatar columns are assumptions carried over from the
+            // original import; a real MicroMsg.db Contact table is not known to
+            // expose them. Kept as-is rather than replaced with a guess.
             var tables = new[] { "Contact", "Contact_V2" };
 
             foreach (var table in tables)
@@ -317,12 +434,29 @@ public class DatabaseService : IDisposable
 
                     while (reader.Read())
                     {
+                        // UserID is read as text on purpose: in a real WeChat database
+                        // it is a wxid. Casting it to a number turned it into 0, which
+                        // is why per-sender lookups could never match (see Contact.Identifier).
+                        var identifier = reader.IsDBNull(0)
+                            ? null
+                            : Convert.ToString(reader.GetValue(0), CultureInfo.InvariantCulture);
+
                         var contact = new Contact
                         {
-                            UserId = reader.GetInt64(0),
+                            Identifier = string.IsNullOrWhiteSpace(identifier) ? null : identifier.Trim(),
                             NickName = reader.IsDBNull(1) ? null : reader.GetString(1),
                             Remark = reader.IsDBNull(2) ? null : reader.GetString(2)
                         };
+
+                        // Numeric ids are still populated when the identifier happens to
+                        // be numeric (the synthetic schema), so Message queries that key
+                        // off UserId keep working.
+                        if (contact.Identifier is not null
+                            && long.TryParse(contact.Identifier, NumberStyles.Integer, CultureInfo.InvariantCulture, out var userId))
+                        {
+                            contact.UserId = userId;
+                        }
+
                         contacts.Add(contact);
                     }
 
@@ -348,46 +482,63 @@ public class DatabaseService : IDisposable
     private List<Contact> GetContactsFromMsgDb(string dbPath)
     {
         var contacts = new List<Contact>();
+        var identifiers = new List<string>();
 
         try
         {
-            // In MSG.db, contacts are stored in the ChatInfo table or similar
+            // UNVERIFIED AGAINST A REAL DATABASE: "ChatInfo" and the Sender/Receiver
+            // columns below are the synthetic schema this app was built around. A
+            // real WeChat MSG*.db uses different table and column names, and this
+            // app does not know them yet - guessing replacements would be worse than
+            // this comment, so the real names are deliberately not invented here.
+            // Contacts should come from MicroMsg.db; this is only the fallback.
+            //
+            // The previous version of this method CAST(Sender AS INTEGER) and then
+            // kept only ids > 0. A real Sender value is a wxid (text), so the CAST
+            // produced 0 and every row was discarded - and the rows that did survive
+            // came with '' names, which is what turned every message into "Unknown".
+            // Sender/Receiver are therefore read as text, exactly as stored.
             var query = @"
-                SELECT DISTINCT
-                    CASE
-                        WHEN Sender IS NOT NULL AND Sender != '' THEN CAST(Sender AS INTEGER)
-                        ELSE 0
-                    END as UserId,
-                    '' as NickName,
-                    '' as Remark
-                FROM ChatInfo
+                SELECT DISTINCT Sender AS Identifier FROM ChatInfo
                 WHERE Sender IS NOT NULL AND Sender != ''
                 UNION
-                SELECT DISTINCT
-                    CASE
-                        WHEN Receiver IS NOT NULL AND Receiver != '' THEN CAST(Receiver AS INTEGER)
-                        ELSE 0
-                    END as UserId,
-                    '' as NickName,
-                    '' as Remark
-                FROM ChatInfo
+                SELECT DISTINCT Receiver FROM ChatInfo
                 WHERE Receiver IS NOT NULL AND Receiver != ''";
 
-            using var cmd = new SqliteCommand(query, _connection);
-            using var reader = cmd.ExecuteReader();
-
-            while (reader.Read())
+            using (var cmd = new SqliteCommand(query, _connection))
+            using (var reader = cmd.ExecuteReader())
             {
-                var userId = reader.GetInt64(0);
-                if (userId > 0)
+                while (reader.Read())
                 {
-                    contacts.Add(new Contact
-                    {
-                        UserId = userId,
-                        NickName = reader.IsDBNull(1) ? null : reader.GetString(1),
-                        Remark = reader.IsDBNull(2) ? null : reader.GetString(2)
-                    });
+                    var identifier = reader.IsDBNull(0)
+                        ? null
+                        : Convert.ToString(reader.GetValue(0), CultureInfo.InvariantCulture);
+
+                    if (string.IsNullOrWhiteSpace(identifier))
+                        continue;
+
+                    // Only the identifiers are discoverable here: this table carries
+                    // no name column in the schema assumed above. Emitting a contact
+                    // per identifier would rebuild exactly the bogus contact list this
+                    // fix removes (empty name, nothing to show), so gather them as a
+                    // diagnostic instead of returning placeholders.
+                    identifiers.Add(identifier.Trim());
                 }
+            }
+
+            if (identifiers.Count > 0)
+            {
+                Log.Warning(
+                    "MSG.db {DbPath} references {Count} sender identifier(s) but exposes no contact name column we can read. Identifiers: {Identifiers}",
+                    dbPath,
+                    identifiers.Count,
+                    string.Join(", ", identifiers.Take(DiscoveredTableListLimit)));
+
+                LastError =
+                    $"Found {identifiers.Count} sender identifier(s) in {Path.GetFileName(dbPath)} "
+                  + $"({string.Join(", ", identifiers.Take(DiscoveredTableListLimit))}) but no contact-name column, "
+                  + "so no contacts could be built from this database. Names have to come from MicroMsg.db; "
+                  + "the MSG database's own contact schema is not mapped yet.";
             }
         }
         catch (Exception ex)
@@ -469,6 +620,10 @@ public class DatabaseService : IDisposable
                     Content = reader.IsDBNull(3) ? null : reader.GetString(3),
                     Type = (MessageType)reader.GetInt32(4),
                     SenderId = isFromSelf ? 0 : contactId,
+                    // The sender exactly as stored (a wxid in a real database). Kept so
+                    // the exports can attribute a message to a stable identifier when no
+                    // display name could be resolved, instead of printing "Unknown".
+                    SenderIdentifier = reader.IsDBNull(7) ? null : reader.GetString(7),
                     // Only the other party needs a name: the UI and the exports render
                     // self-authored messages as "You".
                     SenderName = isFromSelf
@@ -531,35 +686,162 @@ public class DatabaseService : IDisposable
     }
 
     /// <summary>
-    /// Builds a connection to <paramref name="dbPath"/>, applying the same key
-    /// (raw-hex pragma or passphrase) that was used for the main connection.
+    /// Opens <paramref name="dbPath"/> applying the key material captured by
+    /// <see cref="Connect"/>.
     /// </summary>
-    private SqliteConnection CreateConnection(string dbPath)
+    /// <remarks>
+    /// This is the single place key handling lives. Both connection sites - the main
+    /// MSG database and the sibling <c>MicroMsg.db</c> - go through it, so the
+    /// derived-raw-key path and the passphrase path cannot drift apart again (the
+    /// passphrase used to be applied to the main connection string only, which left
+    /// MicroMsg.db being read unkeyed).
+    /// </remarks>
+    private SqliteConnection OpenKeyedConnection(string dbPath)
     {
+        if (_rawHexKey is not null)
+            return OpenRawKeyConnection(dbPath, _rawHexKey);
+
         var builder = new SqliteConnectionStringBuilder
         {
             DataSource = dbPath,
             Mode = SqliteOpenMode.ReadOnly
         };
 
-        if (_rawHexKey is not null)
+        if (_passphrase is not null)
         {
-            // See Connect(): the key is applied by PRAGMA, so the connection must not
-            // be pooled or a differently-keyed open could reuse it.
+            // Non-hex input is a passphrase: the connection-string Password keyword
+            // maps to sqlite3_key with text semantics.
+            builder.Password = _passphrase;
+
+            // A keyed connection must NOT be pooled. See OpenRawKeyConnection().
             builder.Pooling = false;
         }
 
         var connection = new SqliteConnection(builder.ToString());
         connection.Open();
 
-        if (_rawHexKey is not null)
+        _appliedKeyDescription = _passphrase is null ? "none (unencrypted)" : "passphrase";
+
+        using (var probe = connection.CreateCommand())
         {
-            using var keyCommand = connection.CreateCommand();
-            keyCommand.CommandText = $"PRAGMA key = \"x'{_rawHexKey}'\";";
-            keyCommand.ExecuteNonQuery();
+            probe.CommandText = "SELECT count(*) FROM sqlite_master;";
+            probe.ExecuteScalar();
         }
 
         return connection;
+    }
+
+    /// <summary>
+    /// Opens an encrypted database the way WeChat keyed it: the 64-hex key is
+    /// <em>key material</em>, so each candidate's PBKDF2 is run over it (salted with
+    /// the file's own first 16 bytes) and only the DERIVED 32 bytes are handed to
+    /// SQLCipher in its raw-key syntax.
+    /// </summary>
+    /// <exception cref="SqliteException">
+    /// The last failure, when no candidate opens the database. The caller's
+    /// SQLITE_NOTADB handling turns that into <see cref="ConnectOutcome.KeyRejected"/>.
+    /// </exception>
+    private SqliteConnection OpenRawKeyConnection(string dbPath, string rawHexKey)
+    {
+        var keyBytes = Convert.FromHexString(rawHexKey);
+        var salt = ReadSalt(dbPath);
+        SqliteException? lastFailure = null;
+
+        foreach (var candidate in RawKeyCandidates)
+        {
+            // The salt is the file's own first 16 bytes - per-file, not a constant.
+            // (CryptoUtils.GetWeChatDefaultSalt() is unrelated to SQLCipher: it
+            // returns the literal string "wxsecdbkey" and must not be used here.)
+            var derivedHex = Convert.ToHexString(
+                Rfc2898DeriveBytes.Pbkdf2(keyBytes, salt, candidate.Iterations, candidate.Kdf, 32))
+                .ToLowerInvariant();
+
+            var builder = new SqliteConnectionStringBuilder
+            {
+                DataSource = dbPath,
+                Mode = SqliteOpenMode.ReadOnly,
+
+                // A keyed connection must NOT be pooled. The key is applied by a
+                // PRAGMA, so it is not part of the connection string and therefore
+                // not part of Microsoft.Data.Sqlite's pool key. A pooled connection
+                // keeps whichever key it was first opened with, so a later Connect()
+                // with a different (even wrong) key would silently reuse it and
+                // appear to succeed.
+                Pooling = false
+            };
+
+            var connection = new SqliteConnection(builder.ToString());
+            try
+            {
+                connection.Open();
+
+                if (candidate.PageSize != SqlCipherDefaultPageSize)
+                {
+                    // Must precede PRAGMA key.
+                    using var pageSizeCommand = connection.CreateCommand();
+                    pageSizeCommand.CommandText = $"PRAGMA cipher_page_size = {candidate.PageSize};";
+                    pageSizeCommand.ExecuteNonQuery();
+                }
+
+                // The derived bytes are passed as a RAW key, so SQLCipher must not
+                // derive again - that is the point: the KDF has already been run in
+                // C# with the candidate's parameters.
+                using (var keyCommand = connection.CreateCommand())
+                {
+                    keyCommand.CommandText = $"PRAGMA key = \"x'{derivedHex}'\";";
+                    keyCommand.ExecuteNonQuery();
+                }
+
+                // Opening alone proves nothing: SQLite defers reading the header until
+                // the first statement, so a wrong key only fails here. This is also
+                // what decides whether the candidate was the right one.
+                using (var probe = connection.CreateCommand())
+                {
+                    probe.CommandText = "SELECT count(*) FROM sqlite_master;";
+                    probe.ExecuteScalar();
+                }
+
+                _appliedKeyDescription = candidate.Name;
+                Log.Information(
+                    "Opened {DbPath} with SQLCipher key candidate: {Candidate}",
+                    dbPath,
+                    candidate.Name);
+                return connection;
+            }
+            catch (SqliteException ex)
+            {
+                connection.Dispose();
+                lastFailure = ex;
+                Log.Debug(
+                    ex,
+                    "SQLCipher key candidate did not open {DbPath}: {Candidate}",
+                    dbPath,
+                    candidate.Name);
+            }
+        }
+
+        if (lastFailure is not null)
+            throw lastFailure;
+
+        throw new InvalidOperationException("No SQLCipher key candidates are configured.");
+    }
+
+    /// <summary>
+    /// Reads the SQLCipher salt, which is the first 16 bytes of the database file.
+    /// </summary>
+    private static byte[] ReadSalt(string dbPath)
+    {
+        var salt = new byte[SqlCipherSaltSize];
+        using var stream = new FileStream(dbPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+
+        if (stream.Length < SqlCipherSaltSize)
+        {
+            throw new InvalidDataException(
+                $"The database file is {stream.Length} bytes, too small to contain a SQLCipher header ({SqlCipherSaltSize} bytes).");
+        }
+
+        stream.ReadExactly(salt);
+        return salt;
     }
 
     /// <summary>
@@ -586,6 +868,8 @@ public class DatabaseService : IDisposable
         {
             _databasePath = null;
             _rawHexKey = null;
+            _passphrase = null;
+            _appliedKeyDescription = null;
         }
     }
 

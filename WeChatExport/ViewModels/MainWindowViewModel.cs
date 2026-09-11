@@ -206,24 +206,24 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Manual key-capture attempt. Exposes <see cref="KeyCaptureService.IsWeChatRunning"/>
-    /// so a failed attempt gives the user a real hint; the process-memory scan itself
-    /// remains a deliberate stub (see KeyCaptureService.CaptureKeyFromProcess).
+    /// Manual key-capture attempt. A single process enumeration answers both "is it
+    /// running?" and "did we get a key?", so pressing the button no longer walks the
+    /// process list twice. The process-memory scan itself remains a deliberate stub
+    /// (see KeyCaptureService.AttemptCapture).
     /// </summary>
     [RelayCommand]
     private void CaptureKey()
     {
-        var isRunning = _keyCaptureService.IsWeChatRunning();
-        var captured = isRunning ? _keyCaptureService.CaptureKeyFromProcess() : null;
+        var attempt = _keyCaptureService.AttemptCapture();
 
-        if (!string.IsNullOrWhiteSpace(captured))
+        if (!string.IsNullOrWhiteSpace(attempt.Key))
         {
-            DecryptionKey = captured;
+            DecryptionKey = attempt.Key;
             StatusMessage = "Decryption key captured from the running WeChat process";
             return;
         }
 
-        StatusMessage = isRunning
+        StatusMessage = attempt.WeChatRunning
             ? "WeChat is running, but automatic key capture is not implemented yet - paste the key manually."
             : "WeChat does not appear to be running. Start and sign in to WeChat, or paste the key manually.";
     }
@@ -363,12 +363,16 @@ public partial class MainWindowViewModel : ObservableObject
             var contact = SelectedContact;
 
             // Per-sender lookup so a message can be attributed to the sender that
-            // actually wrote it. Where a sender id is not present here,
-            // DatabaseService falls back to the conversation's contact name, which is
-            // what keeps one-to-one chats from rendering a blank sender.
+            // actually wrote it. Keyed by the contact's RAW string identifier (a
+            // wxid), because that is what the database stores in a message's Sender
+            // column - keying by the numeric UserId could never match a wxid, and
+            // CAST(Sender AS INTEGER) turns one into 0. Where a sender is not present
+            // here, DatabaseService falls back to the conversation's contact name and
+            // then to the raw identifier, which is what keeps one-to-one chats from
+            // rendering a blank/discredited sender.
             var senderNames = Contacts
-                .Where(c => c.UserId > 0 && !string.IsNullOrWhiteSpace(c.DisplayName))
-                .GroupBy(c => c.UserId.ToString())
+                .Where(c => !string.IsNullOrWhiteSpace(c.Identifier) && !string.IsNullOrWhiteSpace(c.DisplayName))
+                .GroupBy(c => c.Identifier!)
                 .ToDictionary(g => g.Key, g => g.First().DisplayName!);
 
             var messages = await Task.Run(() =>
