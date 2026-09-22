@@ -19,6 +19,25 @@ WeChatExport/bin/
 WeChatExport/obj/
 publish/
 
+# .NET / Visual Studio
+.vs/
+*.user
+*.userosscache
+*.suo
+*.userprefs
+*.sln.docstates
+[Bb]uild[Ll]og.*
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+TestResults/
+*.nupkg
+*.snupkg
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
 # 发布包
 APP/
 resources/native/
